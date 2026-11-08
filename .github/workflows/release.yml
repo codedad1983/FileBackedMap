@@ -33,16 +33,20 @@ jobs:
           cp target/filebackedmap-*.jar release-assets/
           ls -lh release-assets/
 
+      - name: Resolve version from tag
+        id: ver
+        run: echo "num=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: FileBackedMap v2.0.0
+          name: FileBackedMap v${{ steps.ver.outputs.num }}
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
             release-assets/*.jar
           body: |
-            ## FileBackedMap v2.0.0
+            ## FileBackedMap v${{ steps.ver.outputs.num }}
 
             基于文件存储的 `Map<String, String>` 实现，**数据全部在磁盘上，不驻留内存，也不使用内存映射**。
 
@@ -53,6 +57,7 @@ jobs:
             - 单点提交：重建时写下一代数据文件 `.data.gN`，只重命名索引完成提交；崩溃只会落在「旧索引+旧数据」或「新索引+新数据」。
             - 打开时对账：脏标记 + 头 CRC32，悬空/撕裂槽位转墓碑丢弃，绝不返回错值。
             - 键值长度无上限（单条记录约 2 GB 上限，总量受磁盘限制），支持 null 键 / null 值 / 空串 / 任意 Unicode。
+            - 公开 API 面只有 `java.util.Map` 接口方法 + `close()`，运维信息全部内部化。
 
             ### 性能（100 万条，键值 100–1000 字符随机）
             | 阶段 | 吞吐 | p50 延迟 |
@@ -63,14 +68,16 @@ jobs:
 
             磁盘：索引 32 MB + 数据 1,056 MB = 1,088 MB；内存堆增量 0 MB。
 
-            ### 构建
+            ### 构建与引用
             ```bash
             mvn package
             ```
-            产物：`filebacked-map-2.0.0.jar`（仅生产代码，不含测试类）与 `filebacked-map-2.0.0-sources.jar`。
+            产物：`filebackedmap-${{ steps.ver.outputs.num }}.jar`（仅生产代码，不含测试类）与 `filebackedmap-${{ steps.ver.outputs.num }}-sources.jar`。
+
+            Maven 坐标：`com.codedad:filebackedmap:${{ steps.ver.outputs.num }}`（Java 17+，生产零依赖）。
 
             ### 测试
-            - `com.codedad.fbmap.test.FileBackedMapTest` —— 5330 项断言，与 `HashMap` 逐条对照
-            - `com.codedad.fbmap.crash.CrashSafetyTest` —— 767 项断言，模拟半落盘 / 崩溃状态
+            - `com.codedad.fbmap.test.FileBackedMapTest` —— JUnit 5 黑盒正确性测试（9 用例），与 `HashMap` 逐条对照
+            - `com.codedad.fbmap.crash.CrashSafetyTest` —— JUnit 5 崩溃安全专项（8 用例），模拟半落盘 / 崩溃状态
 
             详见 README。
