@@ -1,6 +1,5 @@
 package com.codedad.fbmap.crash;
 
-import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import org.junit.jupiter.api.DisplayName;
@@ -9,6 +8,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 崩溃 / 异常落盘场景的对账测试（JUnit 5）。
+ * 崩溃 / 异常落盘场景的对账测试（JUnit 5，专项测试）。
  *
  * 用「直接改字节」的方式构造出各种「只完成了一个文件的落盘」的状态，然后打开文件，
  * 验证组件不会返回错值，也不会把错误扩散出去：
@@ -36,6 +36,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>重建只写了新世代数据文件、还没来得及换索引（孤儿文件）；</li>
  *   <li>索引声明的世代数据文件缺失——必须明确报错，绝不静默降级。</li>
  * </ol>
+ * 本类是崩溃安全「专项测试」：对账标记、世代号、垃圾统计、compact 等是组件 private 内部
+ * 信息，黑盒 API 无法观察，因此这里按需用类内反射读取（生产代码与其他常规测试零反射）。
  * 运行：mvn test（surefire 自动执行）。
  */
 final class CrashSafetyTest {
@@ -51,13 +53,69 @@ final class CrashSafetyTest {
     Path dir;
 
     // ------------------------------------------------------------------
-    // 辅助方法
+    // 专项测试专用：类内反射读取 private 内部状态 / 触发 compact
     // ------------------------------------------------------------------
 
-    /** 白盒门面：文件路径 / 世代 / 对账标记 / 统计 / compact 等运维信息只经它访问。 */
-    private static FbmapInspect in(FileBackedMap m) {
-        return new FbmapInspect(m);
+    private static Object call(Object target, String name) {
+        try {
+            Method m = target.getClass().getDeclaredMethod(name);
+            m.setAccessible(true);
+            return m.invoke(target);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("反射调用 " + target.getClass().getSimpleName()
+                    + "#" + name + " 失败（生产类签名可能已变化）", e);
+        }
     }
+
+    /** 现取一份新鲜 Stats 快照并读取某个字段（stats 是瞬时值，不能缓存）。 */
+    private static Object stat(FileBackedMap m, String field) {
+        Object statsObj = call(m, "stats");
+        return call(statsObj, field);
+    }
+
+    private static int dataGeneration(FileBackedMap m) {
+        return (int) call(m, "dataGeneration");
+    }
+
+    private static boolean recoveredFromCrash(FileBackedMap m) {
+        return (boolean) call(m, "recoveredFromCrash");
+    }
+
+    private static int droppedOnRecovery(FileBackedMap m) {
+        return (int) call(m, "droppedOnRecovery");
+    }
+
+    private static Path dataFile(FileBackedMap m) {
+        return (Path) call(m, "dataPath");
+    }
+
+    private static Path indexFile(FileBackedMap m) {
+        return (Path) call(m, "path");
+    }
+
+    private static int tombstones(FileBackedMap m) {
+        return (int) stat(m, "tombstones");
+    }
+
+    private static long garbageBytes(FileBackedMap m) {
+        return (long) stat(m, "garbageBytes");
+    }
+
+    private static long dataBytes(FileBackedMap m) {
+        return (long) stat(m, "dataBytes");
+    }
+
+    private static boolean dirty(FileBackedMap m) {
+        return (boolean) stat(m, "dirty");
+    }
+
+    private static void compact(FileBackedMap m) {
+        call(m, "compact");
+    }
+
+    // ------------------------------------------------------------------
+    // 辅助方法
+    // ------------------------------------------------------------------
 
     private static Path fresh(Path dir, String name) throws IOException {
         Path p = dir.resolve(name);
@@ -138,7 +196,7 @@ final class CrashSafetyTest {
         }
         try (FileBackedMap m = new FileBackedMap(p)) {
             ref.forEach(m::put);
-            assertEquals(0, in(m).dataGeneration(), "C1 世代应为 0");
+            assertEquals(0, dataGeneration(m), "C1 世代应为 0");
         }
 
         long dataLen = Files.size(dir.resolve("cursor.fbmap.data"));
@@ -146,14 +204,14 @@ final class CrashSafetyTest {
         patchHeader(p, dataLen - 60, 1, 0);
 
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertTrue(in(m).recoveredFromCrash(), "C1 应执行对账");
-            assertEquals(0, in(m).droppedOnRecovery(), "C1 不应丢弃任何槽位");
+            assertTrue(recoveredFromCrash(m), "C1 应执行对账");
+            assertEquals(0, droppedOnRecovery(m), "C1 不应丢弃任何槽位");
             assertEquals(ref.size(), m.size(), "C1 对账后 size");
             for (Map.Entry<String, String> e : ref.entrySet()) {
                 assertEquals(e.getValue(), m.get(e.getKey()), "C1 对账后取值 " + e.getKey());
             }
-            assertEquals(dataLen, in(m).dataBytes(), "C1 对账后游标校准为实际文件长度");
-            assertEquals(0L, in(m).garbageBytes(), "C1 对账后无垃圾（所有字节都被活记录覆盖）");
+            assertEquals(dataLen, dataBytes(m), "C1 对账后游标校准为实际文件长度");
+            assertEquals(0L, garbageBytes(m), "C1 对账后无垃圾（所有字节都被活记录覆盖）");
 
             // 关键：对账后游标 = 实际文件长度，下一次 put 必须写在末尾，不得覆盖 k0 这条活记录
             m.put("NEW", "fresh-value");
@@ -161,7 +219,7 @@ final class CrashSafetyTest {
             for (int i = 0; i < 120; i++) {
                 assertEquals(ref.get("k" + i), m.get("k" + i), "C1 追加后旧键仍正确 k" + i);
             }
-            assertTrue(Files.size(in(m).dataFile()) > dataLen, "C1 追加后数据文件变长（未覆盖）");
+            assertTrue(Files.size(dataFile(m)) > dataLen, "C1 追加后数据文件变长（未覆盖）");
         }
 
         // 再打开一次（正常关闭后）确认依然一致
@@ -196,10 +254,10 @@ final class CrashSafetyTest {
         patchHeader(p, Files.size(dir.resolve("dangling.fbmap.data")), 1, 0);
 
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertTrue(in(m).recoveredFromCrash(), "C2 应执行对账");
-            assertEquals(1, in(m).droppedOnRecovery(), "C2 应丢弃 1 个悬空槽位");
+            assertTrue(recoveredFromCrash(m), "C2 应执行对账");
+            assertEquals(1, droppedOnRecovery(m), "C2 应丢弃 1 个悬空槽位");
             assertEquals(ref.size() - 1, m.size(), "C2 对账后 size 减 1");
-            assertEquals(0, in(m).tombstones(), "C2 丢弃后应记为墓碑而非占用");
+            assertEquals(0, tombstones(m), "C2 丢弃后应记为墓碑而非占用");
             int missing = 0;
             for (Map.Entry<String, String> e : ref.entrySet()) {
                 String v = m.get(e.getKey());
@@ -234,11 +292,11 @@ final class CrashSafetyTest {
         patchHeader(p, Files.size(dp), 1, 0);
 
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertTrue(in(m).recoveredFromCrash(), "C3 应执行对账");
-            assertEquals(1, in(m).droppedOnRecovery(), "C3 应丢弃 1 个不可验证的槽位");
+            assertTrue(recoveredFromCrash(m), "C3 应执行对账");
+            assertEquals(1, droppedOnRecovery(m), "C3 应丢弃 1 个不可验证的槽位");
             assertEquals(0, m.size(), "C3 对账后 size = 0");
             assertNull(m.get("only"), "C3 不得返回半条数据");
-            assertEquals(0, in(m).tombstones(), "C3 槽位应为墓碑且 entry=0");
+            assertEquals(0, tombstones(m), "C3 槽位应为墓碑且 entry=0");
         }
     }
 
@@ -263,7 +321,7 @@ final class CrashSafetyTest {
         writeAll(p, b);                // 不重算 CRC：模拟 header 被改但校验没过
 
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertTrue(in(m).recoveredFromCrash(), "C4 CRC 不匹配应触发对账");
+            assertTrue(recoveredFromCrash(m), "C4 CRC 不匹配应触发对账");
             assertEquals(ref.size(), m.size(), "C4 对账后 size");
             for (Map.Entry<String, String> e : ref.entrySet()) {
                 assertEquals(e.getValue(), m.get(e.getKey()), "C4 取值 " + e.getKey());
@@ -285,7 +343,7 @@ final class CrashSafetyTest {
         }
         try (FileBackedMap m = new FileBackedMap(p)) {
             ref.forEach(m::put);
-            assertTrue(in(m).dataGeneration() == 0, "C5 初始世代 0");
+            assertEquals(0, dataGeneration(m), "C5 初始世代 0");
         }
 
         // 模拟：rebuild 已经把新数据写进 g1 并 fsync，但进程在重命名索引之前崩溃
@@ -293,7 +351,7 @@ final class CrashSafetyTest {
         Files.write(g1, new byte[1234]);        // 内容无意义，只是“已写了一半的新数据文件”
 
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertTrue(in(m).dataGeneration() == 0, "C5 仍使用旧世代");
+            assertEquals(0, dataGeneration(m), "C5 仍使用旧世代");
             assertEquals(ref.size(), m.size(), "C5 旧数据 size");
             for (Map.Entry<String, String> e : ref.entrySet()) {
                 assertEquals(e.getValue(), m.get(e.getKey()), "C5 取值 " + e.getKey());
@@ -336,15 +394,15 @@ final class CrashSafetyTest {
         }
         try (FileBackedMap m = new FileBackedMap(p)) {
             ref.forEach(m::put);
-            assertTrue(in(m).dirty(), "C7 会话进行中脏标记应为 true");
+            assertTrue(dirty(m), "C7 会话进行中脏标记应为 true");
         }
         // 正常关闭后，磁盘上的头应已把 FLAG_DIRTY 清零
         int onDiskFlags = ByteBuffer.wrap(readAll(p)).getInt(H_FLAGS);
         assertEquals(0, onDiskFlags & 1, "C7 正常关闭后磁盘上的脏标记应清零");
 
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertFalse(in(m).recoveredFromCrash(), "C7 正常关闭后不应执行对账");
-            assertEquals(0, in(m).droppedOnRecovery(), "C7 无丢弃");
+            assertFalse(recoveredFromCrash(m), "C7 正常关闭后不应执行对账");
+            assertEquals(0, droppedOnRecovery(m), "C7 无丢弃");
             assertEquals(ref.size(), m.size(), "C7 size");
             for (Map.Entry<String, String> e : ref.entrySet()) {
                 assertEquals(e.getValue(), m.get(e.getKey()), "C7 取值 " + e.getKey());
@@ -373,21 +431,21 @@ final class CrashSafetyTest {
                 m.put("r" + i, v);
                 ref.put("r" + i, v);
             }
-            int genBefore = in(m).dataGeneration();
-            in(m).compact();
-            int genAfter = in(m).dataGeneration();
+            int genBefore = dataGeneration(m);
+            compact(m);
+            int genAfter = dataGeneration(m);
             assertEquals(genBefore + 1, genAfter, "C8 compact 后世代号 +1");
             assertEquals(ref.size(), m.size(), "C8 compact 后 size");
-            assertEquals(0L, in(m).garbageBytes(), "C8 compact 后无垃圾");
-            assertEquals(0, in(m).tombstones(), "C8 compact 后无墓碑");
+            assertEquals(0L, garbageBytes(m), "C8 compact 后无垃圾");
+            assertEquals(0, tombstones(m), "C8 compact 后无墓碑");
 
             // 旧世代文件应已不存在
             Path oldData = p.resolveSibling(genBefore == 0
                     ? p.getFileName() + ".data"
                     : p.getFileName() + ".data.g" + genBefore);
             assertFalse(Files.exists(oldData), "C8 旧世代数据文件已删除");
-            assertTrue(Files.exists(in(m).dataFile()), "C8 新世代数据文件存在");
-            assertTrue(in(m).dataFile().getFileName().toString().endsWith("g" + genAfter),
+            assertTrue(Files.exists(dataFile(m)), "C8 新世代数据文件存在");
+            assertTrue(dataFile(m).getFileName().toString().endsWith("g" + genAfter),
                     "C8 新数据文件名含世代号");
 
             for (Map.Entry<String, String> e : ref.entrySet()) {
@@ -396,16 +454,16 @@ final class CrashSafetyTest {
 
             // clear 也走同一套：世代 +1，数据文件归零
             m.clear();
-            assertEquals(genAfter + 1, in(m).dataGeneration(), "C8 clear 后世代号 +1");
+            assertEquals(genAfter + 1, dataGeneration(m), "C8 clear 后世代号 +1");
             assertEquals(0, m.size(), "C8 clear 后 size");
-            assertEquals(0L, Files.size(in(m).dataFile()), "C8 clear 后数据文件为空");
-            assertEquals(64L + 8L * 16, Files.size(in(m).indexFile()), "C8 clear 后索引为最小布局");
+            assertEquals(0L, Files.size(dataFile(m)), "C8 clear 后数据文件为空");
+            assertEquals(64L + 8L * 16, Files.size(indexFile(m)), "C8 clear 后索引为最小布局");
         }
 
         // 重开：世代信息随索引一起持久化
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertEquals(0, m.size(), "C8 重开 size");
-            assertEquals(0L, Files.size(in(m).dataFile()), "C8 重开数据文件为空");
+            assertEquals(0L, Files.size(dataFile(m)), "C8 重开数据文件为空");
             m.put("after-clear", "v");
             assertEquals("v", m.get("after-clear"), "C8 clear 后仍可写入");
         }

@@ -1,6 +1,5 @@
 package com.codedad.fbmap.test;
 
-import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import org.junit.jupiter.api.DisplayName;
@@ -28,6 +27,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * FileBackedMap 的行为验证（JUnit 5，与 java.util.HashMap 逐条对照）。
  *
+ * 本类代表「正常使用」：只用 java.util.Map 接口 + close()，不反射、不触碰任何
+ * 非公开方法。对文件的观察只用普通文件系统 API（索引路径是构造时自己传入的；
+ * 数据文件按固定命名 <索引名>.data / .data.gN 在目录中枚举）。
+ *
  * 运行：mvn test（surefire 自动执行），或 IDE 里直接跑本类。
  * 每个用例独享一个 JUnit @TempDir，用例之间零共享状态。
  */
@@ -37,7 +40,7 @@ final class FileBackedMapTest {
     Path dir;
 
     // ------------------------------------------------------------------
-    // 辅助方法
+    // 辅助方法（只用公开 API 与文件系统）
     // ------------------------------------------------------------------
 
     private static Path fresh(Path dir, String name) throws IOException {
@@ -55,10 +58,16 @@ final class FileBackedMapTest {
         return p;
     }
 
-    /** 索引文件 + 当前数据文件的总占用字节数（运维信息经白盒门面读取）。 */
-    static long totalBytes(FileBackedMap m) throws IOException {
-        FbmapInspect in = new FbmapInspect(m);
-        return Files.size(in.indexFile()) + Files.size(in.dataFile());
+    /** 数据文件字节数：按已知命名（.data / .data.gN）在目录里枚举，无需组件内部信息。 */
+    private static long dataSize(Path dir, String indexName) throws IOException {
+        long sum = 0;
+        try (DirectoryStream<Path> ds =
+                     Files.newDirectoryStream(dir, indexName + ".data*")) {
+            for (Path f : ds) {
+                sum += Files.size(f);
+            }
+        }
+        return sum;
     }
 
     // ------------------------------------------------------------------
@@ -66,7 +75,8 @@ final class FileBackedMapTest {
     @Test
     @DisplayName("基本操作 put / get / remove / size / clear")
     void basicOperations() throws IOException {
-        try (FileBackedMap m = new FileBackedMap(fresh(dir, "basic.fbmap"))) {
+        Path p = fresh(dir, "basic.fbmap");
+        try (FileBackedMap m = new FileBackedMap(p)) {
             assertTrue(m.isEmpty(), "新建 map 应为空");
             assertEquals(0, m.size(), "size 初始值");
             assertNull(m.put("a", "1"), "首次 put 返回 null");
@@ -92,9 +102,8 @@ final class FileBackedMapTest {
             assertEquals(0, m.size(), "clear 后 size");
             assertTrue(m.isEmpty(), "clear 后 isEmpty");
             long expectedIndex = 64 + 8L * 16;   // 头 + 最小槽位区
-            FbmapInspect in = new FbmapInspect(m);
-            assertEquals(expectedIndex, Files.size(in.indexFile()), "clear 后索引文件被截断到最小布局");
-            assertEquals(0L, Files.size(in.dataFile()), "clear 后数据文件为空");
+            assertEquals(expectedIndex, Files.size(p), "clear 后索引文件被截断到最小布局");
+            assertEquals(0L, dataSize(dir, "basic.fbmap"), "clear 后数据文件为空");
         }
     }
 
@@ -333,8 +342,8 @@ final class FileBackedMapTest {
     }
 
     @Test
-    @DisplayName("自动整理 / 文件压缩 / 大量删除后仍一致")
-    void compactionAndStress() throws IOException {
+    @DisplayName("大量更新 / 删除 / 再插入混合后内容仍一致（覆盖自动扩容与自动整理路径，黑盒）")
+    void churnAndStress() throws IOException {
         Path p = fresh(dir, "stress.fbmap");
         HashMap<String, String> ref = new HashMap<>();
         try (FileBackedMap m = new FileBackedMap(p, true)) {   // durable=true，顺便验证 fsync 路径
@@ -345,21 +354,16 @@ final class FileBackedMapTest {
                 ref.put(k, v);
             }
 
-            // 反复改值长度 -> 产生大量垃圾
-            for (int i = 0; i < 2000; i++) {
-                String k = "k" + i;
-                String v = "y".repeat(10 + (i % 200));
-                m.put(k, v);
-                ref.put(k, v);
+            // 反复改值长度 -> 垃圾持续增长，跨过阈值时组件内部自动整理/扩容（黑盒，不可见也不干预）
+            for (int r = 0; r < 5; r++) {
+                for (int i = 0; i < 2000; i++) {
+                    String k = "k" + i;
+                    String v = "y".repeat(10 + ((i + r * 47) % 900));
+                    m.put(k, v);
+                    ref.put(k, v);
+                }
             }
-            long sizeAfterChurn = totalBytes(m);
-            FbmapInspect in = new FbmapInspect(m);
-            in.compact();                             // 手动整理，文件应显著变小
-            long sizeAfterCompact = totalBytes(m);
-            assertTrue(sizeAfterCompact < sizeAfterChurn, "compact 后文件变小");
-            assertEquals(64L + (long) in.slots() * 16, Files.size(p), "compact 后索引区正好等于 头 + 槽位区");
-            assertEquals(0L, in.garbageBytes(), "compact 后垃圾字节为 0");
-            assertTrue(in.dataBytes() > 0, "compact 后数据文件仍有内容");
+            assertTrue(dataSize(dir, "stress.fbmap") > 0, "数据确实写在磁盘上");
 
             // 删除 90% 后逐个核对
             for (int i = 0; i < 2000; i++) {

@@ -1,14 +1,16 @@
 package com.codedad.fbmap.demo;
 
-import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
  * 简单演示：如何把 FileBackedMap 当作普通 Map 使用，同时数据始终在磁盘上。
- * 对外 API 只有 Map 接口 + close()；文件路径 / 统计等运维信息经 FbmapInspect 展示。
+ * 纯黑盒：只用 Map 接口 + close()，不反射、不触碰任何非公开方法；
+ * 文件大小只用普通文件系统 API 观察（索引路径是构造时传入的，
+ * 数据文件按固定命名 <索引名>.data / .data.gN 枚举）。
  */
 public final class Demo {
 
@@ -39,10 +41,8 @@ public final class Demo {
 
             map.remove("city");
             System.out.println("\nremove(city) 后 size = " + map.size());
-            FbmapInspect in = new FbmapInspect(map);
-            System.out.println("stats:\n" + in.statsText());
-            System.out.println("\n索引文件 = " + Files.size(in.indexFile()) + " 字节"
-                    + "，数据文件 = " + Files.size(in.dataFile()) + " 字节");
+            System.out.println("索引文件 = " + Files.size(file) + " 字节"
+                    + "，数据文件 = " + dataSize(file) + " 字节");
         }
 
         // 重新打开，数据依然在
@@ -71,10 +71,22 @@ public final class Demo {
             long during = used(rt);
             System.out.println("\n写入 " + count + " 条 × 1KB（约 20 MB 数据）");
             System.out.println("  索引文件   = " + Files.size(file) / 1024 / 1024 + " MB，数据文件 = "
-                    + Files.size(new FbmapInspect(map).dataFile()) / 1024 / 1024 + " MB");
+                    + dataSize(file) / 1024 / 1024 + " MB");
             System.out.println("  堆占用增量 = " + (during - before) / 1024 + " KB  (仅临时编码缓冲区)");
             System.out.println("  map.size() = " + map.size());
         }
+    }
+
+    /** 数据文件字节数：按固定命名在索引所在目录枚举，无需组件内部信息。 */
+    private static long dataSize(Path indexFile) throws Exception {
+        long sum = 0;
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(
+                indexFile.getParent(), indexFile.getFileName() + ".data*")) {
+            for (Path f : ds) {
+                sum += Files.size(f);
+            }
+        }
+        return sum;
     }
 
     private static long used(Runtime rt) {
@@ -89,7 +101,7 @@ public final class Demo {
         Files.deleteIfExists(indexFile);
         Files.deleteIfExists(dir.resolve(base + ".data"));
         Files.deleteIfExists(dir.resolve(base + ".index.tmp"));
-        try (java.nio.file.DirectoryStream<Path> ds = Files.newDirectoryStream(dir, base + ".data.g*")) {
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, base + ".data.g*")) {
             for (Path f : ds) {
                 Files.deleteIfExists(f);
             }

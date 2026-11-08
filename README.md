@@ -189,16 +189,16 @@ filebackedmap/
 │   ├── main/java/com/codedad/fbmap/
 │   │   └── FileBackedMap.java          ← 组件主体（唯一的生产代码）
 │   └── test/java/com/codedad/fbmap/
-│       ├── FbmapInspect.java            ← 测试侧白盒门面（反射读 private，不进发布 jar）
-│       ├── test/                     ← 正确性测试（JUnit 5，与 HashMap 逐条对照）
+│       ├── test/                     ← 正确性测试（JUnit 5 黑盒，只用 Map 接口）
 │       │   └── FileBackedMapTest.java
 │       ├── crash/                     ← 破坏性测试（JUnit 5，模拟半落盘 / 崩溃）
 │       │   └── CrashSafetyTest.java
-│       ├── bench/                     ← 性能专项测试
+│       ├── bench/                     ← 性能专项测试（按需用反射读内部指标）
 │       │   ├── Benchmark.java          ← 100 万条插入 / 修改 / 查找
 │       │   ├── CompactBench.java      ← 垃圾整理耗时
 │       │   ├── GrowBench.java         ← 扩容专项
 │       │   ├── VerifyFinal.java      ← 校验保留文件
+│       │   ├── BenchInternals.java    ← 专项专用反射读取器（包私有，仅 bench 用）
 │       │   └── SampleGen.java         ← 确定性样本生成器（bench 内部使用）
 │       └── demo/                      ← 演示
 │           └── Demo.java
@@ -266,7 +266,7 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 }
 ```
 
-> 运维类信息（索引/数据文件路径、数据世代号、是否做过崩溃对账、垃圾字节数、手动 `compact()` / `flush()`）在组件内部都保留，但一律 `private`；测试与基准程序通过同包白盒门面 `FbmapInspect`（位于 `src/test/java`，反射实现，不进发布 jar）访问，因此既能验证又不破坏对外封装。
+> 运维类信息（索引/数据文件路径、数据世代号、是否做过崩溃对账、垃圾字节数、手动 `compact()` / `flush()`）在组件内部都保留，但一律 `private`——正常使用不涉及、也拿不到。只有确实需要观察内部状态的**专项测试**才按需用反射读取：崩溃安全测试（`crash` 包，类内私有反射辅助方法）与性能/校验专项（`bench` 包，包私有的 `BenchInternals`）。这些反射代码只存在于 `src/test/java`，不进发布 jar；常规正确性测试与 Demo 是纯黑盒，零反射。
 
 > 部署/备份时注意：索引文件 `<path>` 与它当前的世代数据文件（`<path>.data` 或 `<path>.data.gN`）是一组，**必须一起拷贝**。只拷索引文件会在打开时明确报「数据文件缺失」，不会静默给出错误内容。
 
@@ -284,9 +284,9 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 6. Java 8 默认方法：`putIfAbsent/compute/computeIfAbsent/computeIfPresent/merge/replace/replaceAll/forEach/putAll/remove(k,v)`
 7. 迭代器：遍历计数、迭代 `remove()`、`entry.setValue()` 写回、快速失败
 8. 视图与 `equals/hashCode/toString`
-9. 自动整理：反复改值长度造垃圾 → `compact()` 后文件显著变小（462380 → 309490 字节，数据换到 gen 1）；删 90% 后再插入 3000 条、扩容与墓碑共存，内容仍与 HashMap 完全一致
+9. 压力混合（黑盒）：反复改值长度 5 轮造垃圾、驱动内部自动扩容/自动整理，再删 90%、插入 3000 条，内容仍与 HashMap 完全一致（不触碰任何非公开方法）
 
-`CrashSafetyTest`（`com.codedad.fbmap.crash`）的 8 个用例直接改写文件字节，构造各种「只完成一个文件落盘」的状态：
+`CrashSafetyTest`（`com.codedad.fbmap.crash`）的 8 个用例直接改写文件字节，构造各种「只完成一个文件落盘」的状态。构造靠改文件本身；对账标记、世代号、墓碑/垃圾计数等内部状态属 private，本专项按需用类内反射读取：
 
 | 用例 | 构造的异常状态 | 期望行为 |
 |---|---|---|

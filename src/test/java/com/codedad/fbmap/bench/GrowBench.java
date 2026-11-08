@@ -1,6 +1,5 @@
 package com.codedad.fbmap.bench;
 
-import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import java.nio.file.Files;
@@ -8,12 +7,14 @@ import java.nio.file.Path;
 import java.util.Random;
 
 /**
- * 专门测量「扩容」这一步的代价，验证索引与数据分离的设计效果：
+ * 专门测量「扩容」这一步的代价（性能专项），验证索引与数据分离的设计效果：
  * 扩容只重写槽位区（N × 16 B），不碰数据区（约 1 GB）。
  *
  * 做法：在已有 100 万条的数据文件上继续插入新键，直到负载触发一次扩容，
  * 记录触发扩容那一次 put 的耗时（它几乎全部是扩容开销），
  * 并对比扩容前后索引文件 / 数据文件的大小。
+ *
+ * 槽位数、索引/数据字节数属于组件内部信息，本专项按需用反射读取（见 BenchInternals）。
  */
 public final class GrowBench {
 
@@ -21,18 +22,17 @@ public final class GrowBench {
         Path file = Path.of(args.length > 0 ? args[0] : "build/bench-data/fbmap-1M.fbmap");
 
         try (FileBackedMap map = new FileBackedMap(file)) {
-            FbmapInspect in = new FbmapInspect(map);
-            int slotsBefore = in.slots();
-            int entriesBefore = in.entries();
-            long indexBytesBefore = in.indexBytes();
-            long dataBytesBefore = in.dataBytes();
+            int slotsBefore = BenchInternals.slots(map);
+            int entriesBefore = BenchInternals.entries(map);
+            long indexBytesBefore = BenchInternals.indexBytes(map);
+            long dataBytesBefore = BenchInternals.dataBytes(map);
             System.out.println("基准文件 = " + file.toAbsolutePath());
-            System.out.println("索引大小 = " + Files.size(in.indexFile()) + " B");
-            System.out.println("数据大小 = " + Files.size(in.dataFile())
-                    + " B  (gen " + in.dataGeneration() + ")");
+            System.out.println("索引大小 = " + Files.size(BenchInternals.indexFile(map)) + " B");
+            System.out.println("数据大小 = " + Files.size(BenchInternals.dataFile(map))
+                    + " B  (gen " + BenchInternals.dataGeneration(map) + ")");
             System.out.println();
             System.out.println("初始状态: slots=" + slotsBefore + " entries=" + entriesBefore
-                    + " load=" + String.format("%.3f", in.loadFactor())
+                    + " load=" + String.format("%.3f", BenchInternals.loadFactor(map))
                     + " index=" + indexBytesBefore + " B  data=" + dataBytesBefore + " B");
 
             long growLatency = -1;
@@ -48,11 +48,11 @@ public final class GrowBench {
                 map.put(SampleGen.keyFor(i), SampleGen.valueFor(0x5A5A5A5AL, i));
                 long d = System.nanoTime() - s;
                 inserted++;
-                if (in.slots() != slotsBefore) {
+                if (BenchInternals.slots(map) != slotsBefore) {
                     growLatency = d;
-                    slotsAfter = in.slots();
-                    indexBytesAfter = in.indexBytes();
-                    dataBytesAfterGrow = in.dataBytes();
+                    slotsAfter = BenchInternals.slots(map);
+                    indexBytesAfter = BenchInternals.indexBytes(map);
+                    dataBytesAfterGrow = BenchInternals.dataBytes(map);
                     break;
                 }
                 i++;
