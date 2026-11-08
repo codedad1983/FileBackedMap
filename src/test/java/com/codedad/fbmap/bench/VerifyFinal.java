@@ -1,5 +1,6 @@
 package com.codedad.fbmap.bench;
 
+import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import java.nio.file.Files;
@@ -14,20 +15,21 @@ public final class VerifyFinal {
 
         long t = System.nanoTime();
         try (FileBackedMap m = new FileBackedMap(file)) {
+            FbmapInspect in = new FbmapInspect(m);
             long openMs = (System.nanoTime() - t) / 1_000_000;
 
-            long idxBytes = Files.size(m.path());
-            long datBytes = Files.size(m.dataPath());
-            System.out.println("indexFile = " + m.path());
-            System.out.println("dataFile  = " + m.dataPath() + "  (gen " + m.dataGeneration() + ")");
+            long idxBytes = Files.size(in.indexFile());
+            long datBytes = Files.size(in.dataFile());
+            System.out.println("indexFile = " + in.indexFile());
+            System.out.println("dataFile  = " + in.dataFile() + "  (gen " + in.dataGeneration() + ")");
             System.out.println("indexBytes = " + idxBytes + " (" + idxBytes / 1048576 + " MB)");
             System.out.println("dataBytes  = " + datBytes + " (" + datBytes / 1048576 + " MB)");
             System.out.println("totalBytes = " + (idxBytes + datBytes) + " (" + (idxBytes + datBytes) / 1048576 + " MB)");
             System.out.println("openTime  = " + openMs + " ms");
             System.out.println("size      = " + m.size());
-            System.out.println("recovered = " + m.recoveredFromCrash()
-                    + "  dropped = " + m.droppedOnRecovery());
-            System.out.println("stats     = " + m.stats().toString().replace("\n  ", "\n            "));
+            System.out.println("recovered = " + in.recoveredFromCrash()
+                    + "  dropped = " + in.droppedOnRecovery());
+            System.out.println("stats     = " + in.statsText().replace("\n  ", "\n            "));
 
             Random r = new Random(1);
             int hit = 0;

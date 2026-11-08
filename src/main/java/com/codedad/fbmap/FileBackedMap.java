@@ -229,10 +229,6 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    public static FileBackedMap open(Path path) throws IOException {
-        return new FileBackedMap(path);
-    }
-
     /** gen 0 沿用历史命名 {@code <path>.data}；重建后代沿用 {@code <path>.data.g<n>}。 */
     private static String dataFileName(Path indexFile, int gen) {
         String base = indexFile.getFileName().toString();
@@ -411,8 +407,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    /** 手动把两个文件都刷到磁盘（顺序：数据 → 索引）。 */
-    public void flush() {
+    /** 手动把两个文件都刷到磁盘（顺序：数据 → 索引）。close() 已包含同等动作。 */
+    private void flush() {
         synchronized (this) {
             try {
                 data.force(false);
@@ -423,25 +419,25 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    public Path path() {
+    private Path path() {
         return path;
     }
 
-    public Path dataPath() {
+    private Path dataPath() {
         return dataPath;
     }
 
-    public int dataGeneration() {
+    private int dataGeneration() {
         return dataGen;
     }
 
     /** 本次打开是否做过崩溃对账。 */
-    public boolean recoveredFromCrash() {
+    private boolean recoveredFromCrash() {
         return recoveredFromCrash;
     }
 
     /** 对账时被丢弃的悬空槽位数量。 */
-    public int droppedOnRecovery() {
+    private int droppedOnRecovery() {
         return droppedOnRecovery;
     }
 
@@ -966,7 +962,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    public void compact() {
+    private void compact() {
         synchronized (this) {
             try {
                 rebuild(Math.max(MIN_SLOTS, slotCount), true);
@@ -1859,7 +1855,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     // 统计 / 关闭
     // ==================================================================
 
-    public Stats stats() {
+    private Stats stats() {
         synchronized (this) {
             double load = slotCount == 0 ? 0 : (double) (entryCount + tombstoneCount) / slotCount;
             long idxBytes;
@@ -1876,7 +1872,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    public record Stats(String file, String dataFile, int slots, int entries, int tombstones,
+    private record Stats(String file, String dataFile, int slots, int entries, int tombstones,
                         long indexBytes, long dataBytes, long garbageBytes,
                         double loadFactor, int modCount, int dataGen,
                         boolean recoveredFromCrash, int droppedOnRecovery, boolean dirty) {

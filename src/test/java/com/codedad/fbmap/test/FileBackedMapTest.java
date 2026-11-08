@@ -1,5 +1,6 @@
 package com.codedad.fbmap.test;
 
+import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import org.junit.jupiter.api.DisplayName;
@@ -54,9 +55,10 @@ final class FileBackedMapTest {
         return p;
     }
 
-    /** 索引文件 + 当前数据文件的总占用字节数。 */
+    /** 索引文件 + 当前数据文件的总占用字节数（运维信息经白盒门面读取）。 */
     static long totalBytes(FileBackedMap m) throws IOException {
-        return Files.size(m.path()) + Files.size(m.dataPath());
+        FbmapInspect in = new FbmapInspect(m);
+        return Files.size(in.indexFile()) + Files.size(in.dataFile());
     }
 
     // ------------------------------------------------------------------
@@ -90,8 +92,9 @@ final class FileBackedMapTest {
             assertEquals(0, m.size(), "clear 后 size");
             assertTrue(m.isEmpty(), "clear 后 isEmpty");
             long expectedIndex = 64 + 8L * 16;   // 头 + 最小槽位区
-            assertEquals(expectedIndex, Files.size(m.path()), "clear 后索引文件被截断到最小布局");
-            assertEquals(0L, Files.size(m.dataPath()), "clear 后数据文件为空");
+            FbmapInspect in = new FbmapInspect(m);
+            assertEquals(expectedIndex, Files.size(in.indexFile()), "clear 后索引文件被截断到最小布局");
+            assertEquals(0L, Files.size(in.dataFile()), "clear 后数据文件为空");
         }
     }
 
@@ -350,12 +353,13 @@ final class FileBackedMapTest {
                 ref.put(k, v);
             }
             long sizeAfterChurn = totalBytes(m);
-            m.compact();                              // 手动整理，文件应显著变小
+            FbmapInspect in = new FbmapInspect(m);
+            in.compact();                             // 手动整理，文件应显著变小
             long sizeAfterCompact = totalBytes(m);
             assertTrue(sizeAfterCompact < sizeAfterChurn, "compact 后文件变小");
-            assertEquals(64L + (long) m.stats().slots() * 16, Files.size(p), "compact 后索引区正好等于 头 + 槽位区");
-            assertEquals(0L, m.stats().garbageBytes(), "compact 后垃圾字节为 0");
-            assertTrue(m.stats().dataBytes() > 0, "compact 后数据文件仍有内容");
+            assertEquals(64L + (long) in.slots() * 16, Files.size(p), "compact 后索引区正好等于 头 + 槽位区");
+            assertEquals(0L, in.garbageBytes(), "compact 后垃圾字节为 0");
+            assertTrue(in.dataBytes() > 0, "compact 后数据文件仍有内容");
 
             // 删除 90% 后逐个核对
             for (int i = 0; i < 2000; i++) {

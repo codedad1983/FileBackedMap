@@ -1,11 +1,15 @@
 package com.codedad.fbmap.demo;
 
+import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 
-/** 简单演示：如何把 FileBackedMap 当作普通 Map 使用，同时数据始终在磁盘上。 */
+/**
+ * 简单演示：如何把 FileBackedMap 当作普通 Map 使用，同时数据始终在磁盘上。
+ * 对外 API 只有 Map 接口 + close()；文件路径 / 统计等运维信息经 FbmapInspect 展示。
+ */
 public final class Demo {
 
     public static void main(String[] args) throws Exception {
@@ -35,9 +39,10 @@ public final class Demo {
 
             map.remove("city");
             System.out.println("\nremove(city) 后 size = " + map.size());
-            System.out.println("stats:\n" + map.stats());
-            System.out.println("\n索引文件 = " + Files.size(map.path()) + " 字节"
-                    + "，数据文件 = " + Files.size(map.dataPath()) + " 字节");
+            FbmapInspect in = new FbmapInspect(map);
+            System.out.println("stats:\n" + in.statsText());
+            System.out.println("\n索引文件 = " + Files.size(in.indexFile()) + " 字节"
+                    + "，数据文件 = " + Files.size(in.dataFile()) + " 字节");
         }
 
         // 重新打开，数据依然在
@@ -66,7 +71,7 @@ public final class Demo {
             long during = used(rt);
             System.out.println("\n写入 " + count + " 条 × 1KB（约 20 MB 数据）");
             System.out.println("  索引文件   = " + Files.size(file) / 1024 / 1024 + " MB，数据文件 = "
-                    + Files.size(map.dataPath()) / 1024 / 1024 + " MB");
+                    + Files.size(new FbmapInspect(map).dataFile()) / 1024 / 1024 + " MB");
             System.out.println("  堆占用增量 = " + (during - before) / 1024 + " KB  (仅临时编码缓冲区)");
             System.out.println("  map.size() = " + map.size());
         }

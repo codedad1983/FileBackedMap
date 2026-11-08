@@ -169,7 +169,7 @@
 
 - `durable=true` 时，写操作的顺序是 **data.force → index.force**：索引（指向记录）永远最后落盘，因此不可能出现「索引已持久、记录未持久」的组合。
 - 会话打开即把脏标记写入磁盘；`close()` 清除它再落盘。若进程被强杀，标记仍在 → 下次打开对账。
-- `flush()` 可随时手动落盘（同样 data → index）。
+- 内部 `flush()` 在每次需要时把两个文件刷到磁盘（同样 data → index），不对用户暴露。
 
 ### 5.5 校验与报错边界
 
@@ -189,6 +189,7 @@ filebackedmap/
 │   ├── main/java/com/codedad/fbmap/
 │   │   └── FileBackedMap.java          ← 组件主体（唯一的生产代码）
 │   └── test/java/com/codedad/fbmap/
+│       ├── FbmapInspect.java            ← 测试侧白盒门面（反射读 private，不进发布 jar）
 │       ├── test/                     ← 正确性测试（JUnit 5，与 HashMap 逐条对照）
 │       │   └── FileBackedMapTest.java
 │       ├── crash/                     ← 破坏性测试（JUnit 5，模拟半落盘 / 崩溃）
@@ -250,22 +251,22 @@ mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.bench.Benchmark \
 ```java
 import com.codedad.fbmap.FileBackedMap;
 
+// 对外 API 只有 java.util.Map 接口方法 + close()，其余（文件路径、世代、
+// 统计、compact、flush）全部是 private，用户拿到的就是一个纯粹的 Map。
 try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
     map.put("name", "张三");
     map.put("note", "x".repeat(1_000_000));  // 长度不限
     System.out.println(map.get("name"));     // 张三
     System.out.println(map.size());
-    System.out.println(map.path());       // 索引文件
-    System.out.println(map.dataPath());   // 当前数据文件：kv.fbmap.data，重建后是 kv.fbmap.data.g1 …
-    System.out.println(map.dataGeneration()); // 世代号
 }
 
 // 关闭后重新打开（甚至换个进程），数据仍在（两个文件要一起保留）
 try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
     System.out.println(map.get("name"));     // 张三
-    System.out.println(map.recoveredFromCrash()); // false = 上次正常关闭，没做对账
 }
 ```
+
+> 运维类信息（索引/数据文件路径、数据世代号、是否做过崩溃对账、垃圾字节数、手动 `compact()` / `flush()`）在组件内部都保留，但一律 `private`；测试与基准程序通过同包白盒门面 `FbmapInspect`（位于 `src/test/java`，反射实现，不进发布 jar）访问，因此既能验证又不破坏对外封装。
 
 > 部署/备份时注意：索引文件 `<path>` 与它当前的世代数据文件（`<path>.data` 或 `<path>.data.gN`）是一组，**必须一起拷贝**。只拷索引文件会在打开时明确报「数据文件缺失」，不会静默给出错误内容。
 
@@ -447,7 +448,7 @@ java -Xmx512m -Dbench.n=1000000 -cp $CP com.codedad.fbmap.bench.CompactBench bui
 ## 十、已知取舍
 
 - **每次操作都是文件 I/O**：`get` 一次约 2–3 次定位读取，比 HashMap 慢 3.3–7.2 倍（p50 约 37 µs vs 微秒级）。这是“数据不驻内存”的必然代价。
-- **更新一律追加 → 写放大 1 倍**：这是为了换取崩溃安全（记录不可变、无撕裂记录）。代价是高频更新会持续产生垃圾，最终触发整条数据区重写（1 GB 实测 19.6 s）。若业务偏重更新，建议定期主动 `compact()` 或降低自动整理的频率门槛。
+- **更新一律追加 → 写放大 1 倍**：这是为了换取崩溃安全（记录不可变、无撕裂记录）。代价是高频更新会持续产生垃圾，垃圾超过数据区一半时自动触发整条数据区重写（1 GB 实测 19.6 s）。整理是组件内部职责（`private`），无需也不允许外部干预。
 - **扩容便宜、整理昂贵**：扩容只重写 32 MB 级索引（实测 0.238 s）；整理必须重写数据区。成本差别来自「写字节数」而非「系统调用」。
 - **无缓存**：如需高性能，可在应用层加只读缓存副本（那就等于把数据放回内存，与需求冲突）。
 - **单实例独占一组文件**：不支持多进程同时写同一组文件（没有跨进程锁）；只读并发打开也未加锁。崩溃安全只针对**单进程**异常终止，不对并发写负责。

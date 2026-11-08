@@ -1,5 +1,6 @@
 package com.codedad.fbmap.bench;
 
+import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import java.nio.file.Files;
@@ -20,15 +21,19 @@ public final class GrowBench {
         Path file = Path.of(args.length > 0 ? args[0] : "build/bench-data/fbmap-1M.fbmap");
 
         try (FileBackedMap map = new FileBackedMap(file)) {
-            FileBackedMap.Stats before = map.stats();
+            FbmapInspect in = new FbmapInspect(map);
+            int slotsBefore = in.slots();
+            int entriesBefore = in.entries();
+            long indexBytesBefore = in.indexBytes();
+            long dataBytesBefore = in.dataBytes();
             System.out.println("基准文件 = " + file.toAbsolutePath());
-            System.out.println("索引大小 = " + Files.size(map.path()) + " B");
-            System.out.println("数据大小 = " + Files.size(map.dataPath())
-                    + " B  (gen " + map.dataGeneration() + ")");
+            System.out.println("索引大小 = " + Files.size(in.indexFile()) + " B");
+            System.out.println("数据大小 = " + Files.size(in.dataFile())
+                    + " B  (gen " + in.dataGeneration() + ")");
             System.out.println();
-            System.out.println("初始状态: slots=" + before.slots() + " entries=" + before.entries()
-                    + " load=" + String.format("%.3f", before.loadFactor())
-                    + " index=" + before.indexBytes() + " B  data=" + before.dataBytes() + " B");
+            System.out.println("初始状态: slots=" + slotsBefore + " entries=" + entriesBefore
+                    + " load=" + String.format("%.3f", in.loadFactor())
+                    + " index=" + indexBytesBefore + " B  data=" + dataBytesBefore + " B");
 
             long growLatency = -1;
             int slotsAfter = -1;
@@ -37,18 +42,17 @@ public final class GrowBench {
             int inserted = 0;
             long t = System.nanoTime();
 
-            int i = before.entries();
+            int i = entriesBefore;
             while (true) {
                 long s = System.nanoTime();
                 map.put(SampleGen.keyFor(i), SampleGen.valueFor(0x5A5A5A5AL, i));
                 long d = System.nanoTime() - s;
                 inserted++;
-                FileBackedMap.Stats now = map.stats();
-                if (now.slots() != before.slots()) {
+                if (in.slots() != slotsBefore) {
                     growLatency = d;
-                    slotsAfter = now.slots();
-                    indexBytesAfter = now.indexBytes();
-                    dataBytesAfterGrow = now.dataBytes();
+                    slotsAfter = in.slots();
+                    indexBytesAfter = in.indexBytes();
+                    dataBytesAfterGrow = in.dataBytes();
                     break;
                 }
                 i++;
@@ -58,16 +62,16 @@ public final class GrowBench {
             System.out.printf("为触发扩容额外插入了 %d 条新键（总耗时 %.2f s）%n", inserted, totalSec);
             System.out.printf("触发扩容的那一次 put 耗时 = %.3f s %n", growLatency / 1e9);
             System.out.println();
-            System.out.println("扩容前: slots=" + before.slots() + "  index=" + before.indexBytes() + " B");
+            System.out.println("扩容前: slots=" + slotsBefore + "  index=" + indexBytesBefore + " B");
             System.out.println("扩容后: slots=" + slotsAfter + "  index=" + indexBytesAfter + " B");
-            System.out.println("索引重写字节数 = " + (indexBytesAfter - before.indexBytes()) + " B"
-                    + "  (" + (indexBytesAfter - before.indexBytes()) / 1048576 + " MB)");
-            System.out.println("扩容期间数据文件增长 = " + (dataBytesAfterGrow - before.dataBytes()) + " B"
+            System.out.println("索引重写字节数 = " + (indexBytesAfter - indexBytesBefore) + " B"
+                    + "  (" + (indexBytesAfter - indexBytesBefore) / 1048576 + " MB)");
+            System.out.println("扩容期间数据文件增长 = " + (dataBytesAfterGrow - dataBytesBefore) + " B"
                     + "  (只是本轮新增的 " + inserted + " 条记录，没有任何搬移/重写)");
             System.out.println("数据区总大小 = " + dataBytesAfterGrow + " B  ("
                     + dataBytesAfterGrow / 1048576 + " MB，扩容全程未被重写)");
             System.out.printf("索引重写吞吐 = %.1f MB/s%n",
-                    (indexBytesAfter - before.indexBytes()) / 1048576.0 / (growLatency / 1e9));
+                    (indexBytesAfter - indexBytesBefore) / 1048576.0 / (growLatency / 1e9));
 
             // 扩容后数据仍然正确：抽样核对新增键与原有键
             Random r = new Random(11);

@@ -1,5 +1,6 @@
 package com.codedad.fbmap.bench;
 
+import com.codedad.fbmap.FbmapInspect;
 import com.codedad.fbmap.FileBackedMap;
 
 import java.io.IOException;
@@ -125,9 +126,10 @@ public final class Benchmark {
         System.out.println();
 
         try (FileBackedMap map = new FileBackedMap(file)) {
+            FbmapInspect in = new FbmapInspect(map);
             // ---------- 阶段 1：插入 ----------
             int rebuilds = 0;
-            int lastSlots = map.stats().slots();
+            int lastSlots = in.slots();
             long t = System.nanoTime();
             long phaseStart = t;
             for (int i = 0; i < N; i++) {
@@ -137,7 +139,7 @@ public final class Benchmark {
                 map.put(k, v);
                 lat[i] = System.nanoTime() - s;
                 if (i % 100_000 == 99_999) {
-                    int slots = map.stats().slots();
+                    int slots = in.slots();
                     if (slots != lastSlots) {
                         rebuilds++;
                         lastSlots = slots;
@@ -147,13 +149,13 @@ public final class Benchmark {
                 }
             }
             double insertSec = (System.nanoTime() - t) / 1e9;
-            dumpPhase("INSERT", N, insertSec, lat, map, heapStart, heapUsed(), rebuilds, monitor.peak());
+            dumpPhase("INSERT", N, insertSec, lat, in, heapStart, heapUsed(), rebuilds, monitor.peak());
 
             // ---------- 阶段 2：随机修改 ----------
             Random pick = new Random(0x5DEECE66DL);
             int updated = 0;
             rebuilds = 0;
-            lastSlots = map.stats().slots();
+            lastSlots = in.slots();
             t = System.nanoTime();
             phaseStart = t;
             for (int i = 0; i < N; i++) {
@@ -167,7 +169,7 @@ public final class Benchmark {
                     updated++;
                 }
                 if (i % 100_000 == 99_999) {
-                    int slots = map.stats().slots();
+                    int slots = in.slots();
                     if (slots != lastSlots) {
                         rebuilds++;
                         lastSlots = slots;
@@ -177,7 +179,7 @@ public final class Benchmark {
                 }
             }
             double updateSec = (System.nanoTime() - t) / 1e9;
-            dumpPhase("UPDATE", N, updateSec, lat, map, heapStart, heapUsed(), rebuilds, monitor.peak());
+            dumpPhase("UPDATE", N, updateSec, lat, in, heapStart, heapUsed(), rebuilds, monitor.peak());
             System.out.println("  改值命中（键已存在）= " + updated + " / " + N);
             System.out.println();
 
@@ -201,34 +203,33 @@ public final class Benchmark {
                 }
             }
             double lookupSec = (System.nanoTime() - t) / 1e9;
-            dumpPhase("LOOKUP", N, lookupSec, lat, map, heapStart, heapUsed(), 0, monitor.peak());
+            dumpPhase("LOOKUP", N, lookupSec, lat, in, heapStart, heapUsed(), 0, monitor.peak());
             System.out.println("  查找命中 = " + hits + " / " + N);
 
-            FileBackedMap.Stats st = map.stats();
-            long indexBytes = st.indexBytes();
-            long dataBytes = st.dataBytes();
+            long indexBytes = in.indexBytes();
+            long dataBytes = in.dataBytes();
             long total = indexBytes + dataBytes;
             System.out.println();
             System.out.println("FINAL size      = " + map.size());
-            System.out.println("FINAL index     = " + map.path());
-            System.out.println("FINAL data      = " + map.dataPath());
+            System.out.println("FINAL index     = " + in.indexFile());
+            System.out.println("FINAL data      = " + in.dataFile());
             System.out.println("FINAL indexBytes = " + indexBytes + "  (" + indexBytes / 1048576 + " MB)");
             System.out.println("FINAL dataBytes  = " + dataBytes + "  (" + dataBytes / 1048576 + " MB)");
             System.out.println("FINAL totalBytes = " + total + "  (" + total / 1048576 + " MB)");
-            System.out.println("FINAL slots=" + st.slots() + " entries=" + st.entries()
-                    + " tombstones=" + st.tombstones() + " garbage=" + st.garbageBytes() + " B");
-            System.out.println("FINAL load      = " + String.format("%.3f", st.loadFactor()));
+            System.out.println("FINAL slots=" + in.slots() + " entries=" + in.entries()
+                    + " tombstones=" + in.tombstones() + " garbage=" + in.garbageBytes() + " B");
+            System.out.println("FINAL load      = " + String.format("%.3f", in.loadFactor()));
             System.out.println("FINAL heap      = " + heapUsed() / 1048576 + " MB (start "
                     + heapStart / 1048576 + " MB)");
             System.out.println("FINAL heapPeak  = " + monitor.peak() / 1048576 + " MB");
             monitor.stopMonitor();
-            map.flush();
+            in.flush();
         }
         monitor.stopMonitor();
     }
 
     private static void dumpPhase(String name, int n, double sec, long[] lat,
-                                  FileBackedMap map, long heapStart, long heapNow, int rebuilds, long heapPeak) throws IOException {
+                                  FbmapInspect in, long heapStart, long heapNow, int rebuilds, long heapPeak) {
         long[] copy = lat.clone();
         Arrays.sort(copy);
         double opsPerSec = n / sec;
@@ -241,16 +242,15 @@ public final class Benchmark {
                 copy[(int) Math.min(n - 1, (long) (n * 0.999))] / 1000.0,
                 copy[n - 1] / 1000.0);
 
-        FileBackedMap.Stats st = map.stats();
-        long indexBytes = st.indexBytes();
-        long dataBytes = st.dataBytes();
+        long indexBytes = in.indexBytes();
+        long dataBytes = in.dataBytes();
         System.out.printf("  index=%d bytes (%.1f MB)  data=%d bytes (%.1f MB)  total=%.1f MB%n",
                 indexBytes, indexBytes / 1048576.0,
                 dataBytes, dataBytes / 1048576.0,
                 (indexBytes + dataBytes) / 1048576.0);
         System.out.printf("  garbage=%.1f MB  slots=%d entries=%d tomb=%d load=%.3f%n",
-                st.garbageBytes() / 1048576.0,
-                st.slots(), st.entries(), st.tombstones(), st.loadFactor());
+                in.garbageBytes() / 1048576.0,
+                in.slots(), in.entries(), in.tombstones(), in.loadFactor());
         System.out.printf("  heapNow=%d MB  heapDelta=%d MB  heapPeak=%d MB  rebuilds=%d%n",
                 heapNow / 1048576, (heapNow - heapStart) / 1048576, heapPeak / 1048576, rebuilds);
     }
