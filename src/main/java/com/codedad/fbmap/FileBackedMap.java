@@ -1141,9 +1141,9 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
             writeHeaderTo(out, newSlotCount, entryCount, 0, dataEnd, garbageBytes,
                     flags | FLAG_DIRTY);
-            if (durable) {
-                out.force(false);
-            }
+            // 改名会覆盖旧索引、销毁回滚材料，改名前新内容必须无条件落盘（与 durable 无关）：
+            // 对账只能丢弃悬空槽位，无法重建槽位→记录的映射，落盘不全的槽位区不可恢复。
+            out.force(false);
         }
 
         // ---- 3) 单点提交：重命名索引；数据文件全程原封不动，不受影响 ----
@@ -1237,9 +1237,9 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                     }
                 }
             }
-            if (durable) {
-                outData.force(false);
-            }
+            // W1 必须无条件落盘，与 durable 无关：D1 一旦删掉原始对，data.tmp 就是
+            // 存活记录的唯一副本；未落盘时崩溃会让「tmp 对齐全」的前提失效，恢复无法续做。
+            outData.force(false);
         }
 
         // ---- W2) 写 index.tmp：槽位映射与头（dataEnd = 刚写完的 data.tmp 长度）落盘 ----
@@ -1264,9 +1264,9 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             }
 
             writeHeaderTo(outIndex, newSlotCount, newEntries, 0, newEnd, 0, flags | FLAG_DIRTY);
-            if (durable) {
-                outIndex.force(false);
-            }
+            // W2 同样无条件落盘：index.tmp 的头里写着 dataEnd，恢复时靠它判定 tmp 对是否
+            // 写完；若头还在页缓存里就走到 D1，规则②的校验会失败而无法续做。
+            outIndex.force(false);
         }
 
         // ---- D1 → D2 → R1 → R2：提交线，每步一个原子操作 ----
