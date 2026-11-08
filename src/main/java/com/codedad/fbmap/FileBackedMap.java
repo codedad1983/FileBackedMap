@@ -8,7 +8,6 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -52,8 +51,9 @@ import java.util.zip.CRC32;
  *       只是一个缓存值，打开时一律以实际文件长度为校准值。这样即使头字段落后，也不会
  *       出现「游标倒退、下次追加覆盖仍被槽位引用的活记录」。</li>
  *   <li><b>固定顺序提交线</b>：双文件重建（整理 / 清空）严格按六步执行——
- *       W1 写 {@code <path>.index.tmp} → W2 写 {@code <path>.data.tmp}（各自 fsync）→
+ *       W1 写 {@code <path>.data.tmp} → W2 写 {@code <path>.index.tmp}（各自 fsync）→
  *       D1 删除原索引 → D2 删除原数据 → R1 改名索引 → R2 改名数据。
+ *       数据先写：一次槽位扫描同时完成记录拷贝与新索引的槽位映射，无需二次扫描。
  *       每一步都是原子操作，因此任意崩溃后的文件集合只有六种，且每种都能唯一判定：</li>
  * </ol>
  * <table border="1">
@@ -78,13 +78,13 @@ import java.util.zip.CRC32;
  * 索引文件 &lt;path&gt;
  * ─────────────────────────────────────────────
  * 0      64 B 文件头
- *   +0  "FBMP"   +4 版本(=3)
+ *   +0  "FBMP"   +4 版本(=4)
  *   +8  槽位数   +12 条目数   +16 墓碑数
  *   +20 flags(bit0=脏: 上次未正常关闭/多步更新未完成)
  *   +24 数据区终点（= 数据文件长度，打开时以实际长度校准）
  *   +32 垃圾字节数
- *   +40 保留（v2 时代为数据世代号，v3 恒为 0）
- *   +48 文件头 CRC32（覆盖 0..47 字节）
+ *   +40 文件头 CRC32（覆盖 0..39 字节）
+ *   +44 未使用（写 0，为后续扩展留白）
  * 64    槽位区  slotCount × 16 B
  *   槽位 = [1B 状态][3B 填充][4B hash][8B 数据文件偏移]
  *
@@ -108,7 +108,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
     // ================= 常量 =================
     private static final byte[] MAGIC = {'F', 'B', 'M', 'P'};
-    private static final int FORMAT_VERSION = 3;
+    private static final int FORMAT_VERSION = 4;
 
     /** 重建提交线的固定临时文件名（相对索引文件同目录）：先写后删、只改名，绝不复用旧名。 */
     private static final String INDEX_TMP_SUFFIX = ".index.tmp";
@@ -132,11 +132,9 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     private static final int H_FLAGS = 20;
     private static final int H_DATA_END = 24;
     private static final int H_GARBAGE = 32;
-    /** v2 时代为数据世代号，v3 起恒写 0，仅为保持头部布局与 CRC 覆盖范围不变。 */
-    private static final int H_RESERVED_40 = 40;
-    /** 文件头 CRC32，覆盖 0..47 字节；0 表示没有写过校验（旧格式文件）。 */
-    private static final int H_CRC = 48;
-    private static final int CRC_SPAN = 48;
+    /** 文件头 CRC32，覆盖 0..39 字节。 */
+    private static final int H_CRC = 40;
+    private static final int CRC_SPAN = 40;
 
     private static final int FLAG_DIRTY = 1;
 
@@ -201,7 +199,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if (!hasIndex) {
             // 走到这里说明现场干净且无数据：全新创建。
             createEmpty();
-            cleanupStaleDataFiles();
+            cleanupStaleTmpFiles();
             return;
         }
 
@@ -239,7 +237,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             if (overloaded() || garbageFull()) {
                 maintain();
             }
-            cleanupStaleDataFiles();
+            cleanupStaleTmpFiles();
         } catch (IOException e) {
             closeChannels();
             throw e;
@@ -411,26 +409,10 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    /** 清理遗留文件：两个固定 tmp（恢复后不应存在）与历史世代格式 {@code .data.g*}。 */
-    private void cleanupStaleDataFiles() {
+    /** 防御性清理：恢复流程走完或全新创建后，两个固定 tmp 都不应仍然存在。 */
+    private void cleanupStaleTmpFiles() {
         deleteQuietly(tmpIndexFor(path));
         deleteQuietly(tmpDataFor(path));
-        Path dir = path.getParent();
-        if (dir == null) {
-            return;
-        }
-        String base = path.getFileName().toString();
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, base + ".data*")) {
-            for (Path f : ds) {
-                String n = f.getFileName().toString();
-                if (n.equals(base + ".data") || n.equals(base + DATA_TMP_SUFFIX)) {
-                    continue;   // 现役数据文件与（提交线中的）临时数据文件
-                }
-                deleteQuietly(f);   // 旧格式 .data.g<N> 等历史残留
-            }
-        } catch (IOException ignore) {
-            // 列目录失败不影响正确性
-        }
     }
 
     private void createEmpty() throws IOException {
@@ -513,7 +495,6 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         hb.putInt(H_FLAGS, flags);
         hb.putLong(H_DATA_END, dataEnd);
         hb.putLong(H_GARBAGE, garbage);
-        hb.putInt(H_RESERVED_40, 0);
         CRC32 c = new CRC32();
         c.update(hb.array(), 0, CRC_SPAN);
         hb.putInt(H_CRC, (int) c.getValue());
@@ -1191,8 +1172,10 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
      * 重建：把存活记录连续写进新数据文件，重建索引，然后走固定六步提交线换版。
      * {@code keepRecords=false} 用于 clear()。
      *
-     * 六步顺序严格固定：W1 写 index.tmp（fsync）→ W2 写 data.tmp（fsync）→
+     * 六步顺序严格固定：W1 写 data.tmp（fsync）→ W2 写 index.tmp（fsync）→
      * D1 删除原索引 → D2 删除原数据 → R1 改名索引 → R2 改名数据。
+     * 数据先写：唯一的槽位扫描同时完成「拷贝记录到新数据文件」与「计算新索引的槽位映射」
+     * （记录写入顺序即新偏移顺序），随后写索引只是把内存映射落盘，全程只扫描一次槽位区。
      * 每步原子，崩溃后的六种可达快照全部可被打开时的两条恢复规则唯一判定：
      * 双原始齐 → 删 tmp 回滚；原始不全且 tmp 对有效 → 补齐改名续做。
      * 提交点在语义上是 D1；D1 之后本对象若再遇 I/O 异常，现场交由下次打开自动续做。
@@ -1214,40 +1197,52 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         long newEnd = 0;
         int newEntries = 0;
 
-        // ---- 1) 第一遍槽位扫描：只计算存活记录在新数据文件中的偏移，不动任何文件 ----
-        if (keepRecords) {
-            for (int base = 0; base < slotCount; base += SLOT_BLOCK) {
-                int cnt = Math.min(SLOT_BLOCK, slotCount - base);
-                readAt(index, HEADER_SIZE + (long) base * SLOT_SIZE, inBuf, 0, cnt * SLOT_SIZE);
-                ByteBuffer bb = ByteBuffer.wrap(inBuf, 0, cnt * SLOT_SIZE);
-                for (int j = 0; j < cnt; j++) {
-                    byte st = bb.get();
-                    bb.get(); bb.get(); bb.get();
-                    int h = bb.getInt();
-                    long off = bb.getLong();
-                    if (st != ST_OCCUPIED) {
-                        continue;
-                    }
-                    long len = safeRecordLength(off, dataEnd);
-                    if (len < 0) {
-                        continue;   // 悬空记录：丢弃，重建后的文件不会引用它
-                    }
-                    long nOff = newEnd;
-                    newEnd += len;
+        // ---- W1) 单遍槽位扫描：存活记录按序拷进 data.tmp，同时登记新索引的槽位映射 ----
+        try (RandomAccessFile rd = new RandomAccessFile(tmpData.toFile(), "rw");
+             FileChannel outData = rd.getChannel()) {
+            outData.truncate(0);
 
-                    int idx = h & newMask;
-                    while (dstState[idx] != 0) {
-                        idx = (idx + 1) & newMask;
+            if (keepRecords) {
+                for (int base = 0; base < slotCount; base += SLOT_BLOCK) {
+                    int cnt = Math.min(SLOT_BLOCK, slotCount - base);
+                    readAt(index, HEADER_SIZE + (long) base * SLOT_SIZE, inBuf, 0, cnt * SLOT_SIZE);
+                    ByteBuffer bb = ByteBuffer.wrap(inBuf, 0, cnt * SLOT_SIZE);
+                    for (int j = 0; j < cnt; j++) {
+                        byte st = bb.get();
+                        bb.get(); bb.get(); bb.get();
+                        int h = bb.getInt();
+                        long off = bb.getLong();
+                        if (st != ST_OCCUPIED) {
+                            continue;
+                        }
+                        long len = safeRecordLength(off, dataEnd);
+                        if (len < 0) {
+                            continue;   // 悬空记录：丢弃，重建后的文件不会引用它
+                        }
+                        byte[] rec = new byte[(int) len];
+                        readAt(data, off, rec, 0, rec.length);
+                        writeAt(outData, newEnd, ByteBuffer.wrap(rec));
+
+                        long nOff = newEnd;
+                        newEnd += len;
+
+                        int idx = h & newMask;
+                        while (dstState[idx] != 0) {
+                            idx = (idx + 1) & newMask;
+                        }
+                        dstState[idx] = ST_OCCUPIED;
+                        dstHash[idx] = h;
+                        dstOffset[idx] = nOff;
+                        newEntries++;
                     }
-                    dstState[idx] = ST_OCCUPIED;
-                    dstHash[idx] = h;
-                    dstOffset[idx] = nOff;
-                    newEntries++;
                 }
+            }
+            if (durable) {
+                outData.force(false);
             }
         }
 
-        // ---- W1) 写 index.tmp（头内 dataEnd = 新数据文件的目标长度）----
+        // ---- W2) 写 index.tmp：槽位映射与头（dataEnd = 刚写完的 data.tmp 长度）落盘 ----
         try (RandomAccessFile ri = new RandomAccessFile(tmpIndex.toFile(), "rw");
              FileChannel outIndex = ri.getChannel()) {
             outIndex.truncate(0);
@@ -1274,45 +1269,6 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             }
         }
 
-        // ---- W2) 第二遍槽位扫描：把存活记录按目标偏移写进 data.tmp ----
-        try (RandomAccessFile rd = new RandomAccessFile(tmpData.toFile(), "rw");
-             FileChannel outData = rd.getChannel()) {
-            outData.truncate(0);
-
-            if (keepRecords) {
-                long cursor = 0;
-                for (int base = 0; base < slotCount; base += SLOT_BLOCK) {
-                    int cnt = Math.min(SLOT_BLOCK, slotCount - base);
-                    readAt(index, HEADER_SIZE + (long) base * SLOT_SIZE, inBuf, 0, cnt * SLOT_SIZE);
-                    ByteBuffer bb = ByteBuffer.wrap(inBuf, 0, cnt * SLOT_SIZE);
-                    for (int j = 0; j < cnt; j++) {
-                        byte st = bb.get();
-                        bb.get(); bb.get(); bb.get();
-                        bb.getInt();
-                        long off = bb.getLong();
-                        if (st != ST_OCCUPIED) {
-                            continue;
-                        }
-                        long len = safeRecordLength(off, dataEnd);
-                        if (len < 0) {
-                            continue;   // 与第一遍完全同序同判，cursor 序列一致
-                        }
-                        byte[] rec = new byte[(int) len];
-                        readAt(data, off, rec, 0, rec.length);
-                        writeAt(outData, cursor, ByteBuffer.wrap(rec));
-                        cursor += len;
-                    }
-                }
-                if (cursor != newEnd) {
-                    throw new IOException("内部错误：重建两遍扫描结果不一致 "
-                            + cursor + " != " + newEnd);
-                }
-            }
-            if (durable) {
-                outData.force(false);
-            }
-        }
-
         // ---- D1 → D2 → R1 → R2：提交线，每步一个原子操作 ----
         closeChannels();
         try {
@@ -1334,9 +1290,6 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         dataEnd = newEnd;
         garbageBytes = 0;
         modCount++;
-
-        // ---- 清理历史格式残留（旧 .data.g*）----
-        cleanupStaleDataFiles();
     }
 
     // ==================================================================

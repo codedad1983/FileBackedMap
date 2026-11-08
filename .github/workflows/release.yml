@@ -54,7 +54,7 @@ jobs:
             - 双文件布局：索引文件 `<path>`（64 B 头 + slotCount×16 B 槽位区）+ 数据文件 `<path>.data`（只追加记录区）。
             - 扩容只重建 32 MB 级索引，数据区一字节不动（100 万条目实测 0.238 s，134 MB/s）。
             - 记录不可变：更新一律追加，杜绝撕裂记录。
-            - 单点提交：重建时写下一代数据文件 `.data.gN`，只重命名索引完成提交；崩溃只会落在「旧索引+旧数据」或「新索引+新数据」。
+            - 固定六步提交线：重建严格按「写 data.tmp → 写 index.tmp → 删原索引 → 删原数据 → 改名索引 → 改名数据」执行；打开时两条恢复规则（双原始齐→回滚删 tmp；原始不全且 tmp 对有效→续做改名）唯一判定任意崩溃快照。
             - 打开时对账：脏标记 + 头 CRC32，悬空/撕裂槽位转墓碑丢弃，绝不返回错值。
             - 键值长度无上限（单条记录约 2 GB 上限，总量受磁盘限制），支持 null 键 / null 值 / 空串 / 任意 Unicode。
             - 公开 API 面只有 `java.util.Map` 接口方法 + `close()`，运维信息全部内部化。
@@ -78,6 +78,6 @@ jobs:
 
             ### 测试
             - `com.codedad.fbmap.test.FileBackedMapTest` —— JUnit 5 黑盒正确性测试（9 用例），与 `HashMap` 逐条对照
-            - `com.codedad.fbmap.crash.CrashSafetyTest` —— JUnit 5 崩溃安全专项（8 用例），模拟半落盘 / 崩溃状态
+            - `com.codedad.fbmap.crash.CrashSafetyTest` —— JUnit 5 崩溃安全专项（12 用例），模拟半落盘 / 提交线各步中断状态
 
             详见 README。

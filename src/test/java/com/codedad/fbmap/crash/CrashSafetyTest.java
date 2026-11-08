@@ -10,7 +10,6 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -28,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 崩溃 / 异常落盘场景的测试（JUnit 5，专项测试）。
  *
  * 组件的重建走固定六步提交线：
- * W1 写 index.tmp → W2 写 data.tmp → D1 删原索引 → D2 删原数据 → R1 改名索引 → R2 改名数据。
+ * W1 写 data.tmp → W2 写 index.tmp → D1 删原索引 → D2 删原数据 → R1 改名索引 → R2 改名数据。
  * 任意崩溃后的可达快照与两条恢复规则：
  * <ol>
  *   <li><b>回滚</b>：原索引 + 原数据都还在 → 提交点（D1）未过，tmp 一律是未提交垃圾，删除；</li>
@@ -43,7 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>C5 W1/W2 之后崩溃（双原始 + 有效 tmp 对）——必须回滚，即使 tmp 完整也不得采用；</li>
  *   <li>C6 原索引在、原数据缺失且无 data.tmp——明确报错，不静默降级；</li>
  *   <li>C7 正常关闭：重开不做对账；</li>
- *   <li>C8 重建提交：固定文件名换版，提交后无 tmp 残留，历史 {@code .data.g*} 被清理；</li>
+ *   <li>C8 重建提交：固定文件名换版，提交后无 tmp 残留；</li>
  *   <li>C9 D1 之后崩溃（原数据 + tmp 对）——续做改名，采用新内容；</li>
  *   <li>C10 D2 之后崩溃（只剩 tmp 对）——续做两个改名；</li>
  *   <li>C11 R1 之后崩溃（新索引 + data.tmp）——续做数据改名；</li>
@@ -57,7 +56,8 @@ final class CrashSafetyTest {
 
     private static final int H_FLAGS = 20;
     private static final int H_DATA_END = 24;
-    private static final int H_CRC = 48;
+    private static final int H_CRC = 40;
+    private static final int CRC_SPAN = 40;
     private static final int HEADER_SIZE = 64;
     private static final int SLOT_SIZE = 16;
 
@@ -131,11 +131,6 @@ final class CrashSafetyTest {
         Files.deleteIfExists(dir.resolve(name + ".index.tmp"));
         Files.deleteIfExists(dir.resolve(name + ".data"));
         Files.deleteIfExists(dir.resolve(name + ".data.tmp"));
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, name + ".data.g*")) {
-            for (Path f : ds) {
-                Files.deleteIfExists(f);
-            }
-        }
         return p;
     }
 
@@ -162,7 +157,7 @@ final class CrashSafetyTest {
     private static void recomputeCrc(byte[] headerBytes) {
         ByteBuffer bb = ByteBuffer.wrap(headerBytes);
         CRC32 c = new CRC32();
-        c.update(headerBytes, 0, 48);
+        c.update(headerBytes, 0, CRC_SPAN);
         bb.putInt(H_CRC, (int) c.getValue());
     }
 
@@ -443,7 +438,7 @@ final class CrashSafetyTest {
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("C8 重建提交方式：固定名换版、提交后无 tmp 残留、历史 .data.g* 被清理")
+    @DisplayName("C8 重建提交方式：固定名换版、提交后无 tmp 残留")
     void caseRebuildCommitLine() throws IOException {
         Path p = fresh(dir, "rebuild.fbmap");
         Map<String, String> ref = new HashMap<>();
@@ -460,9 +455,6 @@ final class CrashSafetyTest {
                 ref.put("r" + i, v);
             }
 
-            // 预先放一个旧格式残留，验证打开/重建后的清理
-            Files.write(p.resolveSibling(p.getFileName() + ".data.g7"), new byte[16]);
-
             compact(m);
             assertMatches(ref, m, "C8 compact 后");
             assertEquals(0L, garbageBytes(m), "C8 compact 后无垃圾");
@@ -474,8 +466,6 @@ final class CrashSafetyTest {
                     dataFile(m).getFileName().toString(), "C8 数据文件保持固定名");
             assertFalse(Files.exists(iTmp(p)), "C8 提交后 index.tmp 不残留");
             assertFalse(Files.exists(dTmp(p)), "C8 提交后 data.tmp 不残留");
-            assertFalse(Files.exists(p.resolveSibling(p.getFileName() + ".data.g7")),
-                    "C8 历史 .data.g* 残留被清理");
 
             // clear 也走同一套提交线
             m.clear();
