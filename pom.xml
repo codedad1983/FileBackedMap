@@ -5,8 +5,8 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.codedad</groupId>
-    <artifactId>filebacked-map</artifactId>
-    <version>2.0.0</version>
+    <artifactId>filebackedmap</artifactId>
+    <version>0.0.1</version>
     <packaging>jar</packaging>
 
     <name>FileBackedMap</name>
@@ -17,8 +17,14 @@
         <maven.compiler.release>17</maven.compiler.release>
     </properties>
 
-    <!-- 无第三方运行时依赖：全部是手写实现，测试也是 main() 形式的自校验程序 -->
+    <!-- 生产代码零依赖；JUnit 5 仅用于测试（scope=test，不会带进发布 jar 的依赖树） -->
     <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.3</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -32,15 +38,23 @@
                 </configuration>
             </plugin>
 
-            <!-- mvn compile 只编译（含 src/test/java），不依赖 surefire 跑测试 -->
-            <!-- 单次执行：mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.test.FileBackedMapTest -->
+            <!-- 正确性 / 崩溃安全测试已由 surefire（JUnit 5）接管：mvn test -->
+            <!-- exec 只用于跑不进 surefire 的专项程序（性能 / 演示），例如： -->
+            <!-- mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.bench.Benchmark -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.2.0</version>
                 <configuration>
-                    <mainClass>com.codedad.fbmap.test.FileBackedMapTest</mainClass>
+                    <mainClass>com.codedad.fbmap.demo.Demo</mainClass>
                 </configuration>
+            </plugin>
+
+            <!-- JUnit 5：surefire 3.x 原生支持 Jupiter，自动执行 *Test 类 -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
             </plugin>
 
             <!-- mvn package 产出可用 jar -->

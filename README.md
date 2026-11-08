@@ -5,9 +5,8 @@
 槽位（索引）与数据（记录）分别放在两个文件里：**扩容只重建 32 MB 级索引，数据区一字节都不动**。
 
 - 仓库：<https://github.com/codedad1983/FileBackedMap>
-- 发布包：<https://github.com/codedad1983/FileBackedMap/releases/tag/v2.0.0>
-- 直接下载：`filebacked-map-2.0.0.jar` · `filebacked-map-2.0.0-sources.jar`
-- 坐标：`com.codedad:filebacked-map:2.0.0`（Java 17+，无第三方依赖）
+- 发布页：<https://github.com/codedad1983/FileBackedMap/releases>（推送 `v*` 标签自动构建发布 `filebackedmap-<版本>.jar` 与 `-sources.jar`）
+- 坐标：`com.codedad:filebackedmap:0.0.1`（Java 17+；生产代码零第三方依赖，测试用 JUnit 5）
 
 ## 一、需求对照
 
@@ -184,15 +183,15 @@
 ### 6.1 目录结构（Maven 标准布局）
 
 ```
-filebacked-map/
+filebackedmap/
 ├── pom.xml
 ├── src/
 │   ├── main/java/com/codedad/fbmap/
 │   │   └── FileBackedMap.java          ← 组件主体（唯一的生产代码）
 │   └── test/java/com/codedad/fbmap/
-│       ├── test/                     ← 正确性测试（与 HashMap 逐条对照）
+│       ├── test/                     ← 正确性测试（JUnit 5，与 HashMap 逐条对照）
 │       │   └── FileBackedMapTest.java
-│       ├── crash/                     ← 破坏性测试（模拟半落盘 / 崩溃）
+│       ├── crash/                     ← 破坏性测试（JUnit 5，模拟半落盘 / 崩溃）
 │       │   └── CrashSafetyTest.java
 │       ├── bench/                     ← 性能专项测试
 │       │   ├── Benchmark.java          ← 100 万条插入 / 修改 / 查找
@@ -210,39 +209,35 @@ filebacked-map/
 ### 6.2 直接用 javac（无需 Maven）
 
 ```bash
-# 编译（Java 17+）：生产代码 + 测试代码一起编译，也可分开
+# 编译生产代码（Java 17+）
 javac -encoding UTF-8 -d build/classes $(find src/main/java -name '*.java')
-javac -encoding UTF-8 -d build/classes -cp build/classes $(find src/test/java -name '*.java')
 
 # 运行演示（会打印堆占用几乎不增长）
 java -Dfile.encoding=UTF-8 -cp build/classes com.codedad.fbmap.demo.Demo build/demo-data
-
-# 运行正确性测试（5330 项断言，与 HashMap 逐条对照）
-java -Dfile.encoding=UTF-8 -cp build/classes com.codedad.fbmap.test.FileBackedMapTest build/test-data
-
-# 运行崩溃/落盘顺序测试（767 项断言，直接改写文件字节模拟各种半落盘状态）
-java -Dfile.encoding=UTF-8 -cp build/classes com.codedad.fbmap.crash.CrashSafetyTest build/crash-data
 ```
+
+> 正确性 / 崩溃安全测试是 **JUnit 5** 测试类（`FileBackedMapTest`、`CrashSafetyTest`），推荐用下面的 `mvn test` 运行；若想用 javac 手动编译测试，需要额外把 JUnit Jupiter jar 放进 classpath。
 
 ### 6.3 用 Maven
 
 ```bash
-mvn compile                          # 编译 src/main/java 与 src/test/java
-mvn package                          # 产出 target/filebacked-map-2.0.0.jar 与 -sources.jar
+mvn test                             # 跑 JUnit 5 测试（正确性 9 例 + 崩溃安全 8 例）
+mvn package                          # 测试通过后产出 target/filebackedmap-0.0.1.jar 与 -sources.jar
 
-mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.test.FileBackedMapTest \
-    -Dexec.args="build/test-data"
+# 性能 / 演示等专项程序仍是 main() 形式，不进 surefire，按需 exec:java 运行：
+mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.bench.Benchmark \
+    -Dexec.args="map build/bench-data"
 ```
 
-> 测试程序以 `main()` 自校验形式编写（无第三方依赖，不需要 JUnit），所以 `mvn test` 不会自动跑它们 —— 请按上面的命令行直接调用，或用 `exec:java` 指定主类。GitHub Actions（`ci.yml` / `release.yml`）里也是用 `java -cp target/classes:target/test-classes` 直接跑。
+> `bench`（性能专项）与 `demo`（演示）保留 `main()` 形式、不标注 `@Test`，surefire 不会执行它们，避免 CI 被长耗时性能测试拖慢。GitHub Actions（`ci.yml` / `release.yml`）用 `mvn verify` 一条命令完成编译 + JUnit 测试 + 打包。
 
 ### 6.4 在项目里引用发布包
 
 ```xml
 <dependency>
     <groupId>com.codedad</groupId>
-    <artifactId>filebacked-map</artifactId>
-    <version>2.0.0</version>
+    <artifactId>filebackedmap</artifactId>
+    <version>0.0.1</version>
 </dependency>
 ```
 
@@ -276,7 +271,9 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 
 ## 八、测试覆盖
 
-`FileBackedMapTest` 的 9 组用例（共 **5330 项断言，全部通过**）：
+两套测试均为 **JUnit 5** 测试类（`mvn test` 自动执行，合计 17 个 `@Test`；单个用例内是成百上千条对照断言，任何一条不符即失败）。每个用例使用 JUnit `@TempDir` 独享临时目录，用例之间零共享状态。
+
+`FileBackedMapTest`（`com.codedad.fbmap.test`）的 9 个用例（约 5300+ 项断言，与 `HashMap` 逐条对照）：
 
 1. 基本增删改查、size、clear（clear 后索引回到 64 + 8×16 = 192 B，数据文件为空、世代号 +1）
 2. null 键、null 值、空串、中文、emoji、控制字符，含 null 键/值的各类更新路径
@@ -288,7 +285,7 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 8. 视图与 `equals/hashCode/toString`
 9. 自动整理：反复改值长度造垃圾 → `compact()` 后文件显著变小（462380 → 309490 字节，数据换到 gen 1）；删 90% 后再插入 3000 条、扩容与墓碑共存，内容仍与 HashMap 完全一致
 
-`CrashSafetyTest` 的 8 组用例（共 **767 项断言，全部通过**）直接改写文件字节，构造各种「只完成一个文件落盘」的状态：
+`CrashSafetyTest`（`com.codedad.fbmap.crash`）的 8 个用例直接改写文件字节，构造各种「只完成一个文件落盘」的状态：
 
 | 用例 | 构造的异常状态 | 期望行为 |
 |---|---|---|
@@ -423,15 +420,13 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 ### 9.10 复现命令
 
 ```bash
+# 正确性 + 崩溃安全测试（JUnit 5，约 12 s）
+mvn test
+
+# 性能专项仍是 main() 形式，先编译再用 java 直跑
 javac -encoding UTF-8 -d build/classes $(find src/main/java -name '*.java')
 javac -encoding UTF-8 -d build/classes -cp build/classes $(find src/test/java -name '*.java')
 CP=build/classes
-
-# 正确性测试（5330 断言，约 4 s）
-java -cp $CP com.codedad.fbmap.test.FileBackedMapTest build/test-data
-
-# 崩溃 / 落盘顺序测试（767 断言，约 1 s）
-java -cp $CP com.codedad.fbmap.crash.CrashSafetyTest build/crash-data
 
 # 本组件 100 万条（约 3 分 16 秒）
 java -Xmx256m -cp $CP com.codedad.fbmap.bench.Benchmark map build/bench-data

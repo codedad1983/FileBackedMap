@@ -23,20 +23,14 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Build jar + sources jar
-        run: mvn -B -ntp package
-
-      - name: Verify the jar opens a map correctly
-        run: |
-          java -cp target/classes:target/test-classes \
-            com.codedad.fbmap.test.FileBackedMapTest build/test-data
-          java -cp target/classes:target/test-classes \
-            com.codedad.fbmap.crash.CrashSafetyTest build/crash-data
+      # mvn verify 会先跑 surefire（JUnit 5：正确性 + 崩溃安全测试），再打 jar
+      - name: Build jar + sources jar (runs JUnit tests first)
+        run: mvn -B -ntp verify
 
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          cp target/filebacked-map-*.jar release-assets/
+          cp target/filebackedmap-*.jar release-assets/
           ls -lh release-assets/
 
       - name: Create GitHub Release

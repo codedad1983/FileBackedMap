@@ -21,18 +21,11 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Build (main + test sources)
-        run: mvn -B -ntp package
-
-      - name: Correctness tests (5330 assertions)
-        run: |
-          java -cp target/classes:target/test-classes \
-            com.codedad.fbmap.test.FileBackedMapTest build/test-data
-
-      - name: Crash-safety tests (767 assertions)
-        run: |
-          java -cp target/classes:target/test-classes \
-            com.codedad.fbmap.crash.CrashSafetyTest build/crash-data
+      # surefire 自动执行 JUnit 5 测试：
+      #   FileBackedMapTest  9 个用例（与 HashMap 逐条对照）
+      #   CrashSafetyTest    8 个用例（模拟半落盘 / 崩溃状态）
+      - name: Build + test
+        run: mvn -B -ntp verify
 
       - name: Show artifact
         run: ls -l target/*.jar
