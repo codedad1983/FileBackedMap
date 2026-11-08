@@ -3,11 +3,9 @@
 一个 `Map<String, String>` 的实现，**数据全部保存在磁盘文件里，不驻留内存，也不使用内存映射**。对外 API 与 `java.util.HashMap` 完全一致，可以直接替换使用。
 可用于将海量业务基础数据临时加载到本地进行快速查询，减少对数据库的频繁访问，从而提高处理性能，也能解决某些业务基础数据不断增长，采用HashMap时会将jvm内存耗尽崩溃的问题。
 
-槽位（索引）与数据（记录）分别放在两个文件里：**扩容只重建 32 MB 级索引，数据区一字节都不动**。
-
 - 仓库：<https://github.com/codedad1983/FileBackedMap>
 - 发布页：<https://github.com/codedad1983/FileBackedMap/releases>（推送 `v*` 标签自动构建发布 `filebackedmap-<版本>.jar` 与 `-sources.jar`）
-- 坐标：`com.codedad:filebackedmap:0.0.1`（Java 17+；生产代码零第三方依赖，测试用 JUnit 5）
+- 坐标：`com.codedad:filebackedmap:0.0.1`（Java 17+；生产代码零第三方依赖，测试用 JUnit 5，另有 MapDB 仅作性能对照组）
 
 ## 一、需求对照
 
@@ -199,6 +197,7 @@ filebackedmap/
 │       │   └── CrashSafetyTest.java
 │       ├── bench/                     ← 性能专项测试
 │       │   ├── Benchmark.java          ← 100 万条插入 / 修改 / 查找
+│       │   ├── MapDbBenchmark.java    ← MapDB 对照组（相同场景）
 │       │   ├── CompactBench.java      ← 垃圾整理耗时
 │       │   ├── GrowBench.java         ← 扩容专项
 │       │   ├── VerifyFinal.java      ← 校验保留文件
@@ -449,7 +448,28 @@ java -cp $CP com.codedad.fbmap.bench.GrowBench <copy-of>.fbmap
 
 # 整理耗时（可选，另建目录，不覆盖上面保留的文件，约 2 分 33 秒）
 java -Xmx512m -Dbench.n=1000000 -cp $CP com.codedad.fbmap.bench.CompactBench build/compact-data
+
+# MapDB 对照（约 8 分钟；classpath 需带上 MapDB 及其传递依赖，用 Maven 最省事）
+mvn -q test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
+CP="target/classes;target/test-classes;$(cat target/cp.txt)"     # Windows 用 ; 分隔
+java -Xmx256m -cp "$CP" com.codedad.fbmap.bench.MapDbBenchmark mapdb build/bench-data
 ```
+
+### 9.11 与 MapDB 对照（同样 100 万条、同样样本、同为文件存储）
+
+MapDB 3.1.0（`HTreeMap`，单文件 + mmap，官方推荐的堆外大 Map 用法）是同类「Map 数据放磁盘文件」的成熟第三方实现，作为对照组。`com.codedad.fbmap.bench.MapDbBenchmark` 与 `Benchmark` 使用完全相同的样本（同一 `SampleGen`、同种子）、相同三阶段、相同 `-Xmx256m`（两者都不需要大堆）。
+
+| 阶段 | FileBackedMap | MapDB 3.1.0 | 倍数（本组件 / MapDB） |
+|---|---|---|---|
+| 插入 | **21,363 ops/s**（p50 27.1 µs） | 4,584 ops/s（p50 184.5 µs） | **4.7 倍** |
+| 修改 | **10,028 ops/s**（p50 51.4 µs） | 5,571 ops/s（p50 150.6 µs） | **1.8 倍** |
+| 查找 | **20,450 ops/s**（p50 37.7 µs） | 12,660 ops/s（p50 65.2 µs） | **1.6 倍** |
+| 磁盘 | 1,088 MB（索引 32 + 数据 1,056） | 1,124 MB（单文件） | 本组件小 3.3% |
+| 堆占用 | 9 MB（峰值 70 MB） | 11 MB（峰值 36 MB） | 相当，都远低于同规模 HashMap 的 1,184 MB |
+
+- 三阶段两边最终 size 均为 1,000,000、查找命中均为 1,000,000 / 1,000,000（结果一致，仅速度不同）。
+- FileBackedMap 修改阶段 max 27.7 s 是一次自动垃圾整理重建（第四节）落在统计窗口内；摊薄后 p50/p95/p99 仍全面占优。MapDB insert max 155 ms 为其内部桶分裂。
+- 语义差异：MapDB 提供事务、多 Map、并发容器等完整嵌入式 DB 能力；本组件刻意只做「单文件对 + Map 接口 + 崩溃恢复」这一件事。MapDB 以 `scope=test` 引入作为对照组依赖，不进入发布 jar。
 
 ## 十、已知取舍
 

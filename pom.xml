@@ -17,12 +17,19 @@
         <maven.compiler.release>17</maven.compiler.release>
     </properties>
 
-    <!-- 生产代码零依赖；JUnit 5 仅用于测试（scope=test，不会带进发布 jar 的依赖树） -->
+    <!-- 生产代码零依赖；JUnit 5 与 MapDB 仅用于测试（scope=test，不会带进发布 jar 的依赖树）。
+         MapDB 只被 bench/MapDbBenchmark 用作第三方文件存储 Map 的性能对照组。 -->
     <dependencies>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>5.11.3</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mapdb</groupId>
+            <artifactId>mapdb</artifactId>
+            <version>3.1.0</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
