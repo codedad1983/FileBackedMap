@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build jar + sources jar
+        run: mvn -B -ntp package
+
+      - name: Verify the jar opens a map correctly
+        run: |
+          java -cp target/classes:target/test-classes \
+            com.codedad.fbmap.test.FileBackedMapTest build/test-data
+          java -cp target/classes:target/test-classes \
+            com.codedad.fbmap.crash.CrashSafetyTest build/crash-data
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          cp target/filebacked-map-*.jar release-assets/
+          ls -lh release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FileBackedMap v2.0.0
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/*.jar
+          body: |
+            ## FileBackedMap v2.0.0
+
+            基于文件存储的 `Map<String, String>` 实现，**数据全部在磁盘上，不驻留内存，也不使用内存映射**。
+
+            ### 核心特性
+            - 双文件布局：索引文件 `<path>`（64 B 头 + slotCount×16 B 槽位区）+ 数据文件 `<path>.data`（只追加记录区）。
+            - 扩容只重建 32 MB 级索引，数据区一字节不动（100 万条目实测 0.238 s，134 MB/s）。
+            - 记录不可变：更新一律追加，杜绝撕裂记录。
+            - 单点提交：重建时写下一代数据文件 `.data.gN`，只重命名索引完成提交；崩溃只会落在「旧索引+旧数据」或「新索引+新数据」。
+            - 打开时对账：脏标记 + 头 CRC32，悬空/撕裂槽位转墓碑丢弃，绝不返回错值。
+            - 键值长度无上限（单条记录约 2 GB 上限，总量受磁盘限制），支持 null 键 / null 值 / 空串 / 任意 Unicode。
+
+            ### 性能（100 万条，键值 100–1000 字符随机）
+            | 阶段 | 吞吐 | p50 延迟 |
+            |---|---|---|
+            | 插入 | 23,317 ops/s | 25.70 µs |
+            | 修改 | 10,836 ops/s | 49.60 µs |
+            | 查找 | 20,652 ops/s | 37.50 µs |
+
+            磁盘：索引 32 MB + 数据 1,056 MB = 1,088 MB；内存堆增量 0 MB。
+
+            ### 构建
+            ```bash
+            mvn package
+            ```
+            产物：`filebacked-map-2.0.0.jar`（仅生产代码，不含测试类）与 `filebacked-map-2.0.0-sources.jar`。
+
+            ### 测试
+            - `com.codedad.fbmap.test.FileBackedMapTest` —— 5330 项断言，与 `HashMap` 逐条对照
+            - `com.codedad.fbmap.crash.CrashSafetyTest` —— 767 项断言，模拟半落盘 / 崩溃状态
+
+            详见 README。

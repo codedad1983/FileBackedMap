@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build (main + test sources)
+        run: mvn -B -ntp package
+
+      - name: Correctness tests (5330 assertions)
+        run: |
+          java -cp target/classes:target/test-classes \
+            com.codedad.fbmap.test.FileBackedMapTest build/test-data
+
+      - name: Crash-safety tests (767 assertions)
+        run: |
+          java -cp target/classes:target/test-classes \
+            com.codedad.fbmap.crash.CrashSafetyTest build/crash-data
+
+      - name: Show artifact
+        run: ls -l target/*.jar

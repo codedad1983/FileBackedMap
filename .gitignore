@@ -1,0 +1,25 @@
+# ---- 构建产物 / 运行产物 ----
+target/
+build/
+out/
+*.class
+
+# ---- 基准测试留下的数据文件（单个 1 GB 级，超出 GitHub 单文件上限）----
+build/bench-data/
+build/compact-data/
+build/test-data/
+build/crash-data/
+build/demo-data/
+
+# ---- 本地工具链与工作区元数据 ----
+.tools/
+.workbuddy/
+.idea/
+*.iml
+.vscode/
+
+# ---- 系统 / 编辑器杂项 ----
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
