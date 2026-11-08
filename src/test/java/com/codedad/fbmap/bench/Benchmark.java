@@ -108,8 +108,7 @@ public final class Benchmark {
         Files.deleteIfExists(file);
         Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.data"));
         Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.index.tmp"));
-        Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.data.g1"));
-        Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.data.g2"));
+        Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.data.tmp"));
 
         long[] lat = new long[N];          // 延迟统计数组（8 MB，不属于被测组件）
         long heapStart = heapUsed();       // 已包含统计数组，因此后续 delta 只反映组件

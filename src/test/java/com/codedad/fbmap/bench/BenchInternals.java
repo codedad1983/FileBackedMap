@@ -9,7 +9,7 @@ import java.nio.file.Path;
  * bench 性能专项测试专用的内部信息读取器（package-private，只服务本包 4 个基准程序）。
  *
  * FileBackedMap 对外只有 Map 接口 + close()，其余全是 private。性能报告需要展示
- * 槽位数、垃圾字节、世代切换、compact 耗时等内部指标，黑盒 API 观察不到，
+ * 槽位数、垃圾字节、compact 耗时等内部指标，黑盒 API 观察不到，
  * 因此这一「专项」按需用反射读取。它不是通用门面：常规正确性测试、崩溃测试、
  * Demo 与任何正常使用都不使用它。反射失败直接抛 AssertionError（签名变化即报错）。
  */
@@ -41,10 +41,6 @@ final class BenchInternals {
 
     static Path dataFile(FileBackedMap m) {
         return (Path) call(m, "dataPath");
-    }
-
-    static int dataGeneration(FileBackedMap m) {
-        return (int) call(m, "dataGeneration");
     }
 
     static boolean recoveredFromCrash(FileBackedMap m) {

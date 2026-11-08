@@ -7,7 +7,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -29,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * 本类代表「正常使用」：只用 java.util.Map 接口 + close()，不反射、不触碰任何
  * 非公开方法。对文件的观察只用普通文件系统 API（索引路径是构造时自己传入的；
- * 数据文件按固定命名 <索引名>.data / .data.gN 在目录中枚举）。
+ * 数据文件按固定命名 <索引名>.data 直接访问）。
  *
  * 运行：mvn test（surefire 自动执行），或 IDE 里直接跑本类。
  * 每个用例独享一个 JUnit @TempDir，用例之间零共享状态。
@@ -48,26 +47,14 @@ final class FileBackedMapTest {
         Files.deleteIfExists(p);
         Files.deleteIfExists(dir.resolve(name + ".data"));
         Files.deleteIfExists(dir.resolve(name + ".index.tmp"));
-        // 重建会换世代（.data.gN），把历史世代一并清掉，避免跨用例污染
-        try (DirectoryStream<Path> ds =
-                     Files.newDirectoryStream(dir, name + ".data.g*")) {
-            for (Path f : ds) {
-                Files.deleteIfExists(f);
-            }
-        }
+        Files.deleteIfExists(dir.resolve(name + ".data.tmp"));
         return p;
     }
 
-    /** 数据文件字节数：按已知命名（.data / .data.gN）在目录里枚举，无需组件内部信息。 */
+    /** 数据文件字节数：数据文件固定命名 <索引名>.data，直接按名取，无需组件内部信息。 */
     private static long dataSize(Path dir, String indexName) throws IOException {
-        long sum = 0;
-        try (DirectoryStream<Path> ds =
-                     Files.newDirectoryStream(dir, indexName + ".data*")) {
-            for (Path f : ds) {
-                sum += Files.size(f);
-            }
-        }
-        return sum;
+        Path data = dir.resolve(indexName + ".data");
+        return Files.exists(data) ? Files.size(data) : 0L;
     }
 
     // ------------------------------------------------------------------

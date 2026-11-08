@@ -28,8 +28,7 @@ public final class GrowBench {
             long dataBytesBefore = BenchInternals.dataBytes(map);
             System.out.println("基准文件 = " + file.toAbsolutePath());
             System.out.println("索引大小 = " + Files.size(BenchInternals.indexFile(map)) + " B");
-            System.out.println("数据大小 = " + Files.size(BenchInternals.dataFile(map))
-                    + " B  (gen " + BenchInternals.dataGeneration(map) + ")");
+            System.out.println("数据大小 = " + Files.size(BenchInternals.dataFile(map)) + " B");
             System.out.println();
             System.out.println("初始状态: slots=" + slotsBefore + " entries=" + entriesBefore
                     + " load=" + String.format("%.3f", BenchInternals.loadFactor(map))

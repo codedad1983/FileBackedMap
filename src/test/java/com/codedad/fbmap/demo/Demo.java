@@ -2,7 +2,6 @@ package com.codedad.fbmap.demo;
 
 import com.codedad.fbmap.FileBackedMap;
 
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -10,7 +9,7 @@ import java.nio.file.Path;
  * 简单演示：如何把 FileBackedMap 当作普通 Map 使用，同时数据始终在磁盘上。
  * 纯黑盒：只用 Map 接口 + close()，不反射、不触碰任何非公开方法；
  * 文件大小只用普通文件系统 API 观察（索引路径是构造时传入的，
- * 数据文件按固定命名 <索引名>.data / .data.gN 枚举）。
+ * 数据文件按固定命名 <索引名>.data 直接访问）。
  */
 public final class Demo {
 
@@ -77,16 +76,10 @@ public final class Demo {
         }
     }
 
-    /** 数据文件字节数：按固定命名在索引所在目录枚举，无需组件内部信息。 */
+    /** 数据文件字节数：固定命名 <索引名>.data，直接按名取，无需组件内部信息。 */
     private static long dataSize(Path indexFile) throws Exception {
-        long sum = 0;
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(
-                indexFile.getParent(), indexFile.getFileName() + ".data*")) {
-            for (Path f : ds) {
-                sum += Files.size(f);
-            }
-        }
-        return sum;
+        Path data = indexFile.resolveSibling(indexFile.getFileName() + ".data");
+        return Files.exists(data) ? Files.size(data) : 0L;
     }
 
     private static long used(Runtime rt) {
@@ -94,17 +87,13 @@ public final class Demo {
         return rt.totalMemory() - rt.freeMemory();
     }
 
-    /** 删除索引、当前数据文件与遗留的历史世代，避免跨次运行互相干扰。 */
+    /** 删除索引、数据文件与临时文件，避免跨次运行互相干扰。 */
     private static void cleanPrevious(Path indexFile) throws Exception {
         Path dir = indexFile.getParent();
         String base = indexFile.getFileName().toString();
         Files.deleteIfExists(indexFile);
         Files.deleteIfExists(dir.resolve(base + ".data"));
         Files.deleteIfExists(dir.resolve(base + ".index.tmp"));
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, base + ".data.g*")) {
-            for (Path f : ds) {
-                Files.deleteIfExists(f);
-            }
-        }
+        Files.deleteIfExists(dir.resolve(base + ".data.tmp"));
     }
 }

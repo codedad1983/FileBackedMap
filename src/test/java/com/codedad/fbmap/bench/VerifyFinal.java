@@ -8,7 +8,7 @@ import java.util.Random;
 
 /**
  * 校验基准测试留下的数据文件仍然完整可用，并测量“打开已有文件”的开销（校验专项）。
- * 世代号 / 对账标记 / 统计属于组件内部信息，本专项按需用反射读取（见 BenchInternals）。
+ * 对账标记 / 统计属于组件内部信息，本专项按需用反射读取（见 BenchInternals）。
  */
 public final class VerifyFinal {
 
@@ -22,8 +22,7 @@ public final class VerifyFinal {
             long idxBytes = Files.size(BenchInternals.indexFile(m));
             long datBytes = Files.size(BenchInternals.dataFile(m));
             System.out.println("indexFile = " + BenchInternals.indexFile(m));
-            System.out.println("dataFile  = " + BenchInternals.dataFile(m)
-                    + "  (gen " + BenchInternals.dataGeneration(m) + ")");
+            System.out.println("dataFile  = " + BenchInternals.dataFile(m));
             System.out.println("indexBytes = " + idxBytes + " (" + idxBytes / 1048576 + " MB)");
             System.out.println("dataBytes  = " + datBytes + " (" + datBytes / 1048576 + " MB)");
             System.out.println("totalBytes = " + (idxBytes + datBytes) + " (" + (idxBytes + datBytes) / 1048576 + " MB)");

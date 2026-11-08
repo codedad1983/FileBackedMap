@@ -63,10 +63,6 @@ public final class CompactBench {
         Files.deleteIfExists(dir.resolve(base));
         Files.deleteIfExists(dir.resolve(base + ".index.tmp"));
         Files.deleteIfExists(dir.resolve(base + ".data"));
-        try (java.nio.file.DirectoryStream<Path> ds = Files.newDirectoryStream(dir, base + ".data.g*")) {
-            for (Path f : ds) {
-                Files.deleteIfExists(f);
-            }
-        }
+        Files.deleteIfExists(dir.resolve(base + ".data.tmp"));
     }
 }

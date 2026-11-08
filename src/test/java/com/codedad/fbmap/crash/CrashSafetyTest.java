@@ -13,6 +13,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.zip.CRC32;
@@ -24,19 +25,31 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 崩溃 / 异常落盘场景的对账测试（JUnit 5，专项测试）。
+ * 崩溃 / 异常落盘场景的测试（JUnit 5，专项测试）。
  *
- * 用「直接改字节」的方式构造出各种「只完成了一个文件的落盘」的状态，然后打开文件，
- * 验证组件不会返回错值，也不会把错误扩散出去：
+ * 组件的重建走固定六步提交线：
+ * W1 写 index.tmp → W2 写 data.tmp → D1 删原索引 → D2 删原数据 → R1 改名索引 → R2 改名数据。
+ * 任意崩溃后的可达快照与两条恢复规则：
  * <ol>
- *   <li>数据已追加但文件头还没更新（游标落后）——最危险的一种，旧实现会让下次追加覆盖活记录；</li>
- *   <li>槽位指向数据文件之外（悬空槽位）；</li>
- *   <li>槽位指向一条被截断的记录（撕裂记录）；</li>
- *   <li>文件头 CRC32 损坏；</li>
- *   <li>重建只写了新世代数据文件、还没来得及换索引（孤儿文件）；</li>
- *   <li>索引声明的世代数据文件缺失——必须明确报错，绝不静默降级。</li>
+ *   <li><b>回滚</b>：原索引 + 原数据都还在 → 提交点（D1）未过，tmp 一律是未提交垃圾，删除；</li>
+ *   <li><b>续做</b>：原始不全而 tmp 对齐全有效 → 补齐剩余改名。</li>
  * </ol>
- * 本类是崩溃安全「专项测试」：对账标记、世代号、垃圾统计、compact 等是组件 private 内部
+ * 本测试用「直接改字节 / 摆布文件」的方式构造这些快照，然后打开文件验证恢复行为：
+ * <ul>
+ *   <li>C1 游标落后（追加了记录但头没更新）——对账后不得覆盖活记录；</li>
+ *   <li>C2 悬空槽位（指向数据文件之外）——转墓碑丢弃；</li>
+ *   <li>C3 撕裂记录（记录被截断）——丢弃，不得读出半条数据；</li>
+ *   <li>C4 文件头 CRC 损坏——触发对账；</li>
+ *   <li>C5 W1/W2 之后崩溃（双原始 + 有效 tmp 对）——必须回滚，即使 tmp 完整也不得采用；</li>
+ *   <li>C6 原索引在、原数据缺失且无 data.tmp——明确报错，不静默降级；</li>
+ *   <li>C7 正常关闭：重开不做对账；</li>
+ *   <li>C8 重建提交：固定文件名换版，提交后无 tmp 残留，历史 {@code .data.g*} 被清理；</li>
+ *   <li>C9 D1 之后崩溃（原数据 + tmp 对）——续做改名，采用新内容；</li>
+ *   <li>C10 D2 之后崩溃（只剩 tmp 对）——续做两个改名；</li>
+ *   <li>C11 R1 之后崩溃（新索引 + data.tmp）——续做数据改名；</li>
+ *   <li>C12 原始已删而 tmp 对损坏——无法恢复，明确报错。</li>
+ * </ul>
+ * 本类是崩溃安全「专项测试」：对账标记、垃圾统计、compact 等是组件 private 内部
  * 信息，黑盒 API 无法观察，因此这里按需用类内反射读取（生产代码与其他常规测试零反射）。
  * 运行：mvn test（surefire 自动执行）。
  */
@@ -44,7 +57,6 @@ final class CrashSafetyTest {
 
     private static final int H_FLAGS = 20;
     private static final int H_DATA_END = 24;
-    private static final int H_DATA_GEN = 40;
     private static final int H_CRC = 48;
     private static final int HEADER_SIZE = 64;
     private static final int SLOT_SIZE = 16;
@@ -71,10 +83,6 @@ final class CrashSafetyTest {
     private static Object stat(FileBackedMap m, String field) {
         Object statsObj = call(m, "stats");
         return call(statsObj, field);
-    }
-
-    private static int dataGeneration(FileBackedMap m) {
-        return (int) call(m, "dataGeneration");
     }
 
     private static boolean recoveredFromCrash(FileBackedMap m) {
@@ -122,6 +130,7 @@ final class CrashSafetyTest {
         Files.deleteIfExists(p);
         Files.deleteIfExists(dir.resolve(name + ".index.tmp"));
         Files.deleteIfExists(dir.resolve(name + ".data"));
+        Files.deleteIfExists(dir.resolve(name + ".data.tmp"));
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir, name + ".data.g*")) {
             for (Path f : ds) {
                 Files.deleteIfExists(f);
@@ -130,8 +139,16 @@ final class CrashSafetyTest {
         return p;
     }
 
+    private static Path iTmp(Path index) {
+        return index.resolveSibling(index.getFileName() + ".index.tmp");
+    }
+
+    private static Path dTmp(Path index) {
+        return index.resolveSibling(index.getFileName() + ".data.tmp");
+    }
+
     // ------------------------------------------------------------------
-    // 直接操作文件头的辅助方法（模拟“只写了一半”的状态）
+    // 直接操作文件头 / 摆布快照的辅助方法（模拟提交线各步之后的现场）
     // ------------------------------------------------------------------
 
     private static byte[] readAll(Path p) throws IOException {
@@ -150,12 +167,11 @@ final class CrashSafetyTest {
     }
 
     /** 模拟：数据已写入，但文件头还没来得及更新（崩溃点在 writeHeader 之前）。 */
-    private static void patchHeader(Path indexPath, long dataEnd, int flags, int gen) throws IOException {
+    private static void patchHeader(Path indexPath, long dataEnd, int flags) throws IOException {
         byte[] b = readAll(indexPath);
         ByteBuffer bb = ByteBuffer.wrap(b);
         bb.putInt(H_FLAGS, flags);
         bb.putLong(H_DATA_END, dataEnd);
-        bb.putInt(H_DATA_GEN, gen);
         recomputeCrc(b);
         writeAll(indexPath, b);
     }
@@ -180,6 +196,45 @@ final class CrashSafetyTest {
         writeAll(indexPath, b);
     }
 
+    /**
+     * 以当前健康文件为底，构造一份「清空版」的合法 tmp 对：
+     * index.tmp = 原索引头（计数清零、槽位区清零、dataEnd=0、dirty、CRC 重算），
+     * data.tmp = 空文件（与头声明的 dataEnd=0 一致，能通过恢复逻辑的配对校验）。
+     * 它与原内容可区分（空 vs 非空），用于断言恢复到底采用了哪一份。
+     */
+    private static void makeClearedTmpPair(Path indexPath) throws IOException {
+        byte[] idx = readAll(indexPath);
+        ByteBuffer bb = ByteBuffer.wrap(idx);
+        int slots = bb.getInt(8);
+        Arrays.fill(idx, HEADER_SIZE, HEADER_SIZE + slots * SLOT_SIZE, (byte) 0);
+        bb.putInt(12, 0);              // entries = 0
+        bb.putInt(16, 0);              // tombstones = 0
+        bb.putInt(H_FLAGS, 1);         // dirty
+        bb.putLong(H_DATA_END, 0);
+        bb.putLong(32, 0);             // garbage
+        recomputeCrc(idx);
+        writeAll(iTmp(indexPath), idx);
+        writeAll(dTmp(indexPath), new byte[0]);
+    }
+
+    private static Map<String, String> fill(FileBackedMap m, String prefix, int n, int vlen) {
+        Map<String, String> ref = new HashMap<>();
+        for (int i = 0; i < n; i++) {
+            String k = prefix + i;
+            String v = "v" + i + "-" + "x".repeat(vlen + i % 40);
+            m.put(k, v);
+            ref.put(k, v);
+        }
+        return ref;
+    }
+
+    private static void assertMatches(Map<String, String> ref, FileBackedMap m, String tag) {
+        assertEquals(ref.size(), m.size(), tag + " size");
+        for (Map.Entry<String, String> e : ref.entrySet()) {
+            assertEquals(e.getValue(), m.get(e.getKey()), tag + " 取值 " + e.getKey());
+        }
+    }
+
     // ------------------------------------------------------------------
     // 用例 1：游标落后（追加了记录，但 dataEnd 没更新）
     // ------------------------------------------------------------------
@@ -188,36 +243,29 @@ final class CrashSafetyTest {
     @DisplayName("C1 数据已追加、文件头未更新：游标落后，下次追加不得覆盖活记录")
     void caseCursorBehind() throws IOException {
         Path p = fresh(dir, "cursor.fbmap");
-        Map<String, String> ref = new HashMap<>();
-        for (int i = 0; i < 120; i++) {
-            String k = "k" + i;
-            String v = "v" + i + "-" + "x".repeat(50 + i);
-            ref.put(k, v);
-        }
+        Map<String, String> ref;
+        long dataLen;
         try (FileBackedMap m = new FileBackedMap(p)) {
-            ref.forEach(m::put);
-            assertEquals(0, dataGeneration(m), "C1 世代应为 0");
+            ref = fill(m, "k", 120, 50);
         }
 
-        long dataLen = Files.size(dir.resolve("cursor.fbmap.data"));
+        dataLen = Files.size(dir.resolve("cursor.fbmap.data"));
         // 伪造崩溃点：正常关闭之后再把头改回“游标落后 60 B”，并置脏标记
-        patchHeader(p, dataLen - 60, 1, 0);
+        patchHeader(p, dataLen - 60, 1);
 
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertTrue(recoveredFromCrash(m), "C1 应执行对账");
             assertEquals(0, droppedOnRecovery(m), "C1 不应丢弃任何槽位");
-            assertEquals(ref.size(), m.size(), "C1 对账后 size");
-            for (Map.Entry<String, String> e : ref.entrySet()) {
-                assertEquals(e.getValue(), m.get(e.getKey()), "C1 对账后取值 " + e.getKey());
-            }
+            assertMatches(ref, m, "C1 对账后");
             assertEquals(dataLen, dataBytes(m), "C1 对账后游标校准为实际文件长度");
             assertEquals(0L, garbageBytes(m), "C1 对账后无垃圾（所有字节都被活记录覆盖）");
 
             // 关键：对账后游标 = 实际文件长度，下一次 put 必须写在末尾，不得覆盖 k0 这条活记录
             m.put("NEW", "fresh-value");
             assertEquals("fresh-value", m.get("NEW"), "C1 新键可读");
-            for (int i = 0; i < 120; i++) {
-                assertEquals(ref.get("k" + i), m.get("k" + i), "C1 追加后旧键仍正确 k" + i);
+            assertEquals(ref.size() + 1, m.size(), "C1 追加后 size");
+            for (Map.Entry<String, String> e : ref.entrySet()) {
+                assertEquals(e.getValue(), m.get(e.getKey()), "C1 追加后旧键 " + e.getKey());
             }
             assertTrue(Files.size(dataFile(m)) > dataLen, "C1 追加后数据文件变长（未覆盖）");
         }
@@ -238,12 +286,9 @@ final class CrashSafetyTest {
     @DisplayName("C2 槽位指向数据文件之外：应转墓碑丢弃，绝不返回无法验证的内容")
     void caseDanglingSlot() throws IOException {
         Path p = fresh(dir, "dangling.fbmap");
-        Map<String, String> ref = new HashMap<>();
-        for (int i = 0; i < 50; i++) {
-            ref.put("d" + i, "value-" + i);
-        }
+        Map<String, String> ref;
         try (FileBackedMap m = new FileBackedMap(p)) {
-            ref.forEach(m::put);
+            ref = fill(m, "d", 50, 6);
         }
 
         int slot = occupiedSlotIndex(p);
@@ -251,7 +296,7 @@ final class CrashSafetyTest {
 
         // 把其中一个槽位的偏移改到远远超出数据文件末尾
         patchSlotOffset(p, slot, Files.size(dir.resolve("dangling.fbmap.data")) + 999_999);
-        patchHeader(p, Files.size(dir.resolve("dangling.fbmap.data")), 1, 0);
+        patchHeader(p, Files.size(dir.resolve("dangling.fbmap.data")), 1);
 
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertTrue(recoveredFromCrash(m), "C2 应执行对账");
@@ -289,7 +334,7 @@ final class CrashSafetyTest {
         try (RandomAccessFile raf = new RandomAccessFile(dp.toFile(), "rw")) {
             raf.setLength(len - 200);
         }
-        patchHeader(p, Files.size(dp), 1, 0);
+        patchHeader(p, Files.size(dp), 1);
 
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertTrue(recoveredFromCrash(m), "C3 应执行对账");
@@ -308,12 +353,9 @@ final class CrashSafetyTest {
     @DisplayName("C4 文件头 CRC32 损坏：应触发对账，而不是相信计数")
     void caseBadCrc() throws IOException {
         Path p = fresh(dir, "crc.fbmap");
-        Map<String, String> ref = new HashMap<>();
-        for (int i = 0; i < 40; i++) {
-            ref.put("c" + i, "val-" + i);
-        }
+        Map<String, String> ref;
         try (FileBackedMap m = new FileBackedMap(p)) {
-            ref.forEach(m::put);
+            ref = fill(m, "c", 40, 4);
         }
 
         byte[] b = readAll(p);
@@ -322,62 +364,54 @@ final class CrashSafetyTest {
 
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertTrue(recoveredFromCrash(m), "C4 CRC 不匹配应触发对账");
-            assertEquals(ref.size(), m.size(), "C4 对账后 size");
-            for (Map.Entry<String, String> e : ref.entrySet()) {
-                assertEquals(e.getValue(), m.get(e.getKey()), "C4 取值 " + e.getKey());
-            }
+            assertMatches(ref, m, "C4 对账后");
         }
     }
 
     // ------------------------------------------------------------------
-    // 用例 5：重建只写了新世代数据文件、索引还没换（孤儿文件）
+    // 用例 5：W1/W2 之后崩溃——双原始 + 完整有效的 tmp 对 → 必须回滚
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("C5 重建只落盘了数据文件、索引未提交：旧索引 + 旧数据仍可用")
-    void caseOrphanGeneration() throws IOException {
-        Path p = fresh(dir, "orphan.fbmap");
-        Map<String, String> ref = new HashMap<>();
-        for (int i = 0; i < 60; i++) {
-            ref.put("o" + i, "vv-" + i + "-" + "z".repeat(30));
-        }
+    @DisplayName("C5 提交点前崩溃（双原始+有效tmp对）：一律回滚删除 tmp，绝不采用未提交内容")
+    void caseRollbackBeforeCommitPoint() throws IOException {
+        Path p = fresh(dir, "w1.fbmap");
+        Map<String, String> ref;
         try (FileBackedMap m = new FileBackedMap(p)) {
-            ref.forEach(m::put);
-            assertEquals(0, dataGeneration(m), "C5 初始世代 0");
+            ref = fill(m, "o", 60, 30);
         }
 
-        // 模拟：rebuild 已经把新数据写进 g1 并 fsync，但进程在重命名索引之前崩溃
-        Path g1 = dir.resolve("orphan.fbmap.data.g1");
-        Files.write(g1, new byte[1234]);        // 内容无意义，只是“已写了一半的新数据文件”
+        // 模拟：重建已把「清空版」新对写完并 fsync，但还没走到 D1
+        makeClearedTmpPair(p);
+        assertTrue(Files.exists(iTmp(p)) && Files.exists(dTmp(p)), "C5 快照构造完成");
 
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertEquals(0, dataGeneration(m), "C5 仍使用旧世代");
-            assertEquals(ref.size(), m.size(), "C5 旧数据 size");
-            for (Map.Entry<String, String> e : ref.entrySet()) {
-                assertEquals(e.getValue(), m.get(e.getKey()), "C5 取值 " + e.getKey());
-            }
+            assertMatches(ref, m, "C5 回滚后仍是旧内容");
+            assertFalse(m.isEmpty(), "C5 绝不能采用 tmp 里的清空版");
+            assertTrue(recoveredFromCrash(m), "C5 回滚应记为一次崩溃恢复");
         }
-        assertFalse(Files.exists(g1), "C5 孤儿世代文件应被清理");
+        assertFalse(Files.exists(iTmp(p)), "C5 index.tmp 应被删除");
+        assertFalse(Files.exists(dTmp(p)), "C5 data.tmp 应被删除");
     }
 
     // ------------------------------------------------------------------
-    // 用例 6：索引声明的世代数据文件缺失 —— 必须报错
+    // 用例 6：原索引在、原数据缺失且无 data.tmp —— 必须报错
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("C6 索引指向的数据文件缺失：明确报错（不静默降级）")
-    void caseMissingGeneration() throws IOException {
+    @DisplayName("C6 原数据缺失且无 data.tmp：明确报错（不静默降级）")
+    void caseMissingDataNoTmp() throws IOException {
         Path p = fresh(dir, "missing.fbmap");
         try (FileBackedMap m = new FileBackedMap(p)) {
             m.put("k", "v");
         }
-        patchHeader(p, Files.size(dir.resolve("missing.fbmap.data")), 0, 7);
+        Files.delete(dir.resolve("missing.fbmap.data"));
 
         assertThrows(IOException.class, () -> {
             try (FileBackedMap leaked = new FileBackedMap(p)) {
                 leaked.size();   // 不应走到这里
             }
-        }, "C6 数据文件缺失应抛 IOException");
+        }, "C6 数据文件缺失且无 data.tmp 应抛 IOException");
     }
 
     // ------------------------------------------------------------------
@@ -388,12 +422,9 @@ final class CrashSafetyTest {
     @DisplayName("C7 正常关闭：脏标记被清除，重开不做对账")
     void caseCleanClose() throws IOException {
         Path p = fresh(dir, "clean.fbmap");
-        Map<String, String> ref = new HashMap<>();
-        for (int i = 0; i < 30; i++) {
-            ref.put("q" + i, "w-" + i);
-        }
+        Map<String, String> ref;
         try (FileBackedMap m = new FileBackedMap(p)) {
-            ref.forEach(m::put);
+            ref = fill(m, "q", 30, 2);
             assertTrue(dirty(m), "C7 会话进行中脏标记应为 true");
         }
         // 正常关闭后，磁盘上的头应已把 FLAG_DIRTY 清零
@@ -403,20 +434,17 @@ final class CrashSafetyTest {
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertFalse(recoveredFromCrash(m), "C7 正常关闭后不应执行对账");
             assertEquals(0, droppedOnRecovery(m), "C7 无丢弃");
-            assertEquals(ref.size(), m.size(), "C7 size");
-            for (Map.Entry<String, String> e : ref.entrySet()) {
-                assertEquals(e.getValue(), m.get(e.getKey()), "C7 取值 " + e.getKey());
-            }
+            assertMatches(ref, m, "C7");
         }
     }
 
     // ------------------------------------------------------------------
-    // 用例 8：重建（compact / clear）走世代切换 + 只重命名索引
+    // 用例 8：重建（compact / clear）走固定名六步提交线
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("C8 重建提交方式：数据换世代、索引单点重命名")
-    void caseRebuildCommitsByRename() throws IOException {
+    @DisplayName("C8 重建提交方式：固定名换版、提交后无 tmp 残留、历史 .data.g* 被清理")
+    void caseRebuildCommitLine() throws IOException {
         Path p = fresh(dir, "rebuild.fbmap");
         Map<String, String> ref = new HashMap<>();
         try (FileBackedMap m = new FileBackedMap(p)) {
@@ -431,41 +459,156 @@ final class CrashSafetyTest {
                 m.put("r" + i, v);
                 ref.put("r" + i, v);
             }
-            int genBefore = dataGeneration(m);
+
+            // 预先放一个旧格式残留，验证打开/重建后的清理
+            Files.write(p.resolveSibling(p.getFileName() + ".data.g7"), new byte[16]);
+
             compact(m);
-            int genAfter = dataGeneration(m);
-            assertEquals(genBefore + 1, genAfter, "C8 compact 后世代号 +1");
-            assertEquals(ref.size(), m.size(), "C8 compact 后 size");
+            assertMatches(ref, m, "C8 compact 后");
             assertEquals(0L, garbageBytes(m), "C8 compact 后无垃圾");
             assertEquals(0, tombstones(m), "C8 compact 后无墓碑");
 
-            // 旧世代文件应已不存在
-            Path oldData = p.resolveSibling(genBefore == 0
-                    ? p.getFileName() + ".data"
-                    : p.getFileName() + ".data.g" + genBefore);
-            assertFalse(Files.exists(oldData), "C8 旧世代数据文件已删除");
-            assertTrue(Files.exists(dataFile(m)), "C8 新世代数据文件存在");
-            assertTrue(dataFile(m).getFileName().toString().endsWith("g" + genAfter),
-                    "C8 新数据文件名含世代号");
+            // 固定名换版：数据文件仍叫 <path>.data，且两个 tmp 都不应存在
+            assertTrue(Files.exists(dataFile(m)), "C8 数据文件存在");
+            assertEquals(p.getFileName() + ".data",
+                    dataFile(m).getFileName().toString(), "C8 数据文件保持固定名");
+            assertFalse(Files.exists(iTmp(p)), "C8 提交后 index.tmp 不残留");
+            assertFalse(Files.exists(dTmp(p)), "C8 提交后 data.tmp 不残留");
+            assertFalse(Files.exists(p.resolveSibling(p.getFileName() + ".data.g7")),
+                    "C8 历史 .data.g* 残留被清理");
 
-            for (Map.Entry<String, String> e : ref.entrySet()) {
-                assertEquals(e.getValue(), m.get(e.getKey()), "C8 取值 " + e.getKey());
-            }
-
-            // clear 也走同一套：世代 +1，数据文件归零
+            // clear 也走同一套提交线
             m.clear();
-            assertEquals(genAfter + 1, dataGeneration(m), "C8 clear 后世代号 +1");
             assertEquals(0, m.size(), "C8 clear 后 size");
             assertEquals(0L, Files.size(dataFile(m)), "C8 clear 后数据文件为空");
             assertEquals(64L + 8L * 16, Files.size(indexFile(m)), "C8 clear 后索引为最小布局");
+            assertFalse(Files.exists(iTmp(p)), "C8 clear 后 index.tmp 不残留");
+            assertFalse(Files.exists(dTmp(p)), "C8 clear 后 data.tmp 不残留");
         }
 
-        // 重开：世代信息随索引一起持久化
+        // 重开确认
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertEquals(0, m.size(), "C8 重开 size");
             assertEquals(0L, Files.size(dataFile(m)), "C8 重开数据文件为空");
             m.put("after-clear", "v");
             assertEquals("v", m.get("after-clear"), "C8 clear 后仍可写入");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 用例 9：D1 之后崩溃（原数据 + 有效 tmp 对）→ 续做改名，采用新内容
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("C9 D1 后崩溃（原数据+tmp对）：续做两个改名，采用 tmp 内容")
+    void caseContinueAfterDeleteIndex() throws IOException {
+        Path p = fresh(dir, "d1.fbmap");
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            fill(m, "e", 40, 20);
+        }
+
+        // 构造「清空版」tmp 对（合法且与原内容不同），然后模拟 D1：删除原索引
+        makeClearedTmpPair(p);
+        Files.delete(p);
+
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            assertEquals(0, m.size(), "C9 续做后应采用新内容（空表）");
+            assertTrue(recoveredFromCrash(m), "C9 续做应记为一次崩溃恢复");
+            assertFalse(Files.exists(iTmp(p)), "C9 index.tmp 已改名转正");
+            assertFalse(Files.exists(dTmp(p)), "C9 data.tmp 已改名转正");
+            assertEquals(0L, Files.size(p.resolveSibling(p.getFileName() + ".data")),
+                    "C9 转正后的数据文件为空");
+            m.put("post", "ok");
+            assertEquals("ok", m.get("post"), "C9 恢复后可正常写入");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 用例 10：D2 之后崩溃（只剩 tmp 对）→ 续做两个改名
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("C10 D2 后崩溃（只剩 tmp 对）：补齐两个改名")
+    void caseContinueAfterDeleteBoth() throws IOException {
+        Path p = fresh(dir, "d2.fbmap");
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            fill(m, "f", 40, 20);
+        }
+
+        makeClearedTmpPair(p);
+        // 模拟 D1 + D2：两个原始都删了，改名还没做
+        Files.delete(p);
+        Files.delete(dir.resolve("d2.fbmap.data"));
+
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            assertEquals(0, m.size(), "C10 续做后 size");
+            assertTrue(Files.exists(p) && Files.exists(dir.resolve("d2.fbmap.data")),
+                    "C10 两个文件都回到固定名");
+            m.put("post", "ok");
+            assertEquals("ok", m.get("post"), "C10 恢复后可正常写入");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 用例 11：R1 之后崩溃（新索引已就位，data.tmp 未转正）→ 续做数据改名
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("C11 R1 后崩溃（新索引+data.tmp）：续做数据改名")
+    void caseContinueAfterRenameIndex() throws IOException {
+        Path p = fresh(dir, "r1.fbmap");
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            fill(m, "g", 40, 20);
+        }
+
+        makeClearedTmpPair(p);
+        // 模拟 D1、D2、R1：原始都删除，index.tmp 已改名转正，只剩 data.tmp
+        Files.delete(p);
+        Files.delete(dir.resolve("r1.fbmap.data"));
+        Files.move(iTmp(p), p);
+
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            assertEquals(0, m.size(), "C11 续做后 size");
+            assertFalse(Files.exists(dTmp(p)), "C11 data.tmp 已转正");
+            assertEquals(0L, Files.size(dir.resolve("r1.fbmap.data")),
+                    "C11 转正后的数据文件为空");
+            assertTrue(recoveredFromCrash(m), "C11 应记为一次崩溃恢复");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 用例 12：原始已删而 tmp 对损坏 → 明确报错
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("C12 原始已删且 tmp 对损坏：无法恢复，明确报错")
+    void caseUnrecoverable() throws IOException {
+        Path p = fresh(dir, "dead.fbmap");
+
+        // 快照 A：只剩一对损坏的 tmp
+        Files.write(iTmp(p), "garbage-not-an-index".getBytes());
+        Files.write(dTmp(p), new byte[9]);
+        assertThrows(IOException.class, () -> {
+            try (FileBackedMap leaked = new FileBackedMap(p)) {
+                leaked.size();
+            }
+        }, "C12-A 损坏 tmp 对应抛 IOException");
+        Files.delete(iTmp(p));
+        Files.delete(dTmp(p));
+
+        // 快照 B：R1 后 data.tmp 丢失（新索引在、数据无处可寻）
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            m.put("h", "v");
+        }
+        makeClearedTmpPair(p);
+        Files.delete(p);
+        Files.delete(dir.resolve("dead.fbmap.data"));
+        Files.move(iTmp(p), p);           // 新索引转正
+        Files.delete(dTmp(p));            // 数据丢失
+        assertThrows(IOException.class, () -> {
+            try (FileBackedMap leaked = new FileBackedMap(p)) {
+                leaked.size();
+            }
+        }, "C12-B 新索引缺配套数据应抛 IOException");
     }
 }
