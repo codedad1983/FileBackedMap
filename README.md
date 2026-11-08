@@ -193,12 +193,12 @@ filebackedmap/
 │       │   └── FileBackedMapTest.java
 │       ├── crash/                     ← 破坏性测试（JUnit 5，模拟半落盘 / 崩溃）
 │       │   └── CrashSafetyTest.java
-│       ├── bench/                     ← 性能专项测试（按需用反射读内部指标）
+│       ├── bench/                     ← 性能专项测试
 │       │   ├── Benchmark.java          ← 100 万条插入 / 修改 / 查找
 │       │   ├── CompactBench.java      ← 垃圾整理耗时
 │       │   ├── GrowBench.java         ← 扩容专项
 │       │   ├── VerifyFinal.java      ← 校验保留文件
-│       │   ├── BenchInternals.java    ← 专项专用反射读取器（包私有，仅 bench 用）
+│       │   ├── BenchInternals.java    ← 专项测试辅助工具（仅 bench 内部使用）
 │       │   └── SampleGen.java         ← 确定性样本生成器（bench 内部使用）
 │       └── demo/                      ← 演示
 │           └── Demo.java
@@ -284,7 +284,7 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 8. 视图与 `equals/hashCode/toString`
 9. 压力混合（黑盒）：反复改值长度 5 轮造垃圾、驱动内部自动扩容/自动整理，再删 90%、插入 3000 条，内容仍与 HashMap 完全一致（不触碰任何非公开方法）
 
-`CrashSafetyTest`（`com.codedad.fbmap.crash`）的 8 个用例直接改写文件字节，构造各种「只完成一个文件落盘」的状态。构造靠改文件本身；对账标记、世代号、墓碑/垃圾计数等内部状态属 private，本专项按需用类内反射读取：
+`CrashSafetyTest`（`com.codedad.fbmap.crash`）的 8 个用例直接改写文件字节，构造各种「只完成一个文件落盘」的状态：
 
 | 用例 | 构造的异常状态 | 期望行为 |
 |---|---|---|
