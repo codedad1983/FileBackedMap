@@ -4,6 +4,11 @@
 
 槽位（索引）与数据（记录）分别放在两个文件里：**扩容只重建 32 MB 级索引，数据区一字节都不动**。
 
+- 仓库：<https://github.com/codedad1983/FileBackedMap>
+- 发布包：<https://github.com/codedad1983/FileBackedMap/releases/tag/v2.0.0>
+- 直接下载：`filebacked-map-2.0.0.jar` · `filebacked-map-2.0.0-sources.jar`
+- 坐标：`com.codedad:filebacked-map:2.0.0`（Java 17+，无第三方依赖）
+
 ## 一、需求对照
 
 | 要求 | 实现方式 |
@@ -223,13 +228,25 @@ java -Dfile.encoding=UTF-8 -cp build/classes com.codedad.fbmap.crash.CrashSafety
 
 ```bash
 mvn compile                          # 编译 src/main/java 与 src/test/java
-mvn package                          # 产出 target/filebacked-map-2.0.0.jar（仅含生产代码）
+mvn package                          # 产出 target/filebacked-map-2.0.0.jar 与 -sources.jar
 
 mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.test.FileBackedMapTest \
     -Dexec.args="build/test-data"
 ```
 
-> 测试程序以 `main()` 自校验形式编写（无第三方依赖，不需要 JUnit），所以 `mvn test` 不会自动跑它们 —— 请按上面的命令行直接调用，或用 `exec:java` 指定主类。
+> 测试程序以 `main()` 自校验形式编写（无第三方依赖，不需要 JUnit），所以 `mvn test` 不会自动跑它们 —— 请按上面的命令行直接调用，或用 `exec:java` 指定主类。GitHub Actions（`ci.yml` / `release.yml`）里也是用 `java -cp target/classes:target/test-classes` 直接跑。
+
+### 6.4 在项目里引用发布包
+
+```xml
+<dependency>
+    <groupId>com.codedad</groupId>
+    <artifactId>filebacked-map</artifactId>
+    <version>2.0.0</version>
+</dependency>
+```
+
+> 该产物未发布到 Maven Central（无中央仓库部署），所以要直接用请下载 GitHub Release 里的 jar 放到本地仓库，或用 `system` 作用域引用本地 jar。仓库本身已配好 CI 与 Release 工作流：推送 `v*` 标签即自动构建并发布。
 
 > Windows 控制台默认 GBK，Java 输出 UTF-8 中文会乱码，可加 `| iconv -f GBK -t UTF-8` 或改用 `chcp 65001`。程序本身读写文件始终使用 UTF-8，不受影响。
 
