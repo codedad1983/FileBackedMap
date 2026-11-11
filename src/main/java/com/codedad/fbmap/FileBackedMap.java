@@ -5,7 +5,10 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -22,6 +25,7 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -103,6 +107,21 @@ import java.util.zip.CRC32;
  *   <li>不使用内存映射（无 {@code FileChannel.map} / {@code MappedByteBuffer}），
  *       也不把文件整体读入堆；只做定长定位读写。</li>
  * </ul>
+ *
+ * <h2>并发模型</h2>
+ * <ul>
+ *   <li><b>进程内</b>：读写锁（{@link ReentrantReadWriteLock}）。纯读操作
+ *       （get / containsKey / containsValue / size / isEmpty / equals / hashCode / toString /
+ *       迭代器扫描）取<b>读锁</b>，可并发；写操作与「读-改-写」复合方法
+ *       （put / remove / compute* / merge / replace* / forEach / replaceAll）取<b>写锁</b>独占。
+ *       复合方法整体在写锁内执行，其回调函数内再调用本实例的任何方法都安全（锁可重入）。
+ *       共享缓冲（槽位、比较缓冲等）为线程私有，读锁下的并发读互不干扰。</li>
+ *   <li><b>跨进程</b>：打开时对索引文件持有独占 {@link FileLock}，同一组文件被第二个进程
+ *       打开时立即抛 {@link IOException}，进程终止时由系统自动释放。
+ *       POSIX 上为建议性锁（只约束同样走本类的进程），Windows 上由系统强制。</li>
+ *   <li>迭代器 fail-fast：任何写操作（含其它线程）触发
+ *       {@link ConcurrentModificationException}。</li>
+ * </ul>
  */
 public final class FileBackedMap implements Map<String, String>, Closeable {
 
@@ -165,13 +184,29 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     /** 文件头 CRC32 是否与内容匹配（旧格式文件没有 CRC 时视为通过）。 */
     private boolean crcValid = true;
 
-    // 复用缓冲
-    private final byte[] slotBytes = new byte[SLOT_SIZE];
-    private final ByteBuffer slotBuf = ByteBuffer.wrap(slotBytes);
-    private final byte[] headerBytes = new byte[HEADER_SIZE];
-    private final ByteBuffer headerBuf = ByteBuffer.wrap(headerBytes);
-    private final byte[] intBytes = new byte[4];
-    private byte[] compareBuffer = new byte[1024];
+    /**
+     * 跨进程独占锁：打开时对索引文件加独占 {@link FileLock}，持有到 close()。
+     * 进程崩溃 / 强杀时由操作系统随句柄一起释放，因此不会留下需要清理的锁文件。
+     */
+    private FileLock indexLock;
+
+    /**
+     * 进程内读写锁。纯读方法取读锁（并发），写方法与「读-改-写」复合方法取写锁（独占）。
+     * 复合方法把回调函数也包在写锁内，回调中重入本实例任意方法安全（写锁可降级重入）。
+     */
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock.ReadLock readLock = lock.readLock();
+    private final ReentrantReadWriteLock.WriteLock writeLock = lock.writeLock();
+
+    // 复用缓冲：读锁下多个读者并发访问，必须线程私有（ThreadLocal），不能用共享实例字段。
+    private final ThreadLocal<byte[]> slotBytes = ThreadLocal.withInitial(() -> new byte[SLOT_SIZE]);
+    private final ThreadLocal<ByteBuffer> slotBuf =
+            ThreadLocal.withInitial(() -> ByteBuffer.wrap(slotBytes.get()));
+    private final ThreadLocal<byte[]> headerBytes = ThreadLocal.withInitial(() -> new byte[HEADER_SIZE]);
+    private final ThreadLocal<ByteBuffer> headerBuf =
+            ThreadLocal.withInitial(() -> ByteBuffer.wrap(headerBytes.get()));
+    private final ThreadLocal<byte[]> intBytes = ThreadLocal.withInitial(() -> new byte[4]);
+    private final ThreadLocal<byte[]> compareBuffer = ThreadLocal.withInitial(() -> new byte[1024]);
 
     // ==================================================================
     // 构造 / 打开
@@ -191,20 +226,24 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             Files.createDirectories(parent);
         }
 
-        // 打开第一步：按两条恢复规则走完可能中断的提交线（回滚或续做）。
-        recoverCommitLine();
-
-        Path dataFile = dataFileFor(this.path);
-        boolean hasIndex = Files.exists(this.path) && Files.size(this.path) > 0;
-        if (!hasIndex) {
-            // 走到这里说明现场干净且无数据：全新创建。
-            createEmpty();
-            cleanupStaleTmpFiles();
-            return;
-        }
-
-        openIndexFile();
+        // 打开第一步：先占住这组文件（打开索引通道并取独占锁），再走两条恢复规则。
+        // 顺序不能反：恢复会删除 / 改名临时文件与索引文件，必须先确认没有第二个进程
+        // 正在使用这组文件，否则会把对方正在写的 data.tmp 当成未提交垃圾删掉。
+        // openIndexFile 必须在 try 内：取锁失败时通道已经打开，不关闭就会泄漏句柄
+        // （Windows 上泄漏的句柄等同于持有文件锁，会让后续打开一直失败）。
         try {
+            openIndexFile();
+            recoverCommitLine();
+
+            Path dataFile = dataFileFor(this.path);
+            boolean hasIndex = Files.exists(this.path) && Files.size(this.path) > 0;
+            if (!hasIndex) {
+                // 走到这里说明现场干净且无数据：全新创建。
+                createEmpty();
+                cleanupStaleTmpFiles();
+                return;
+            }
+
             loadHeader();
             dataPath = dataFile;
             if (!Files.exists(dataPath)) {
@@ -249,6 +288,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     //   规则 1：原索引 + 原数据都在 → 提交点（D1）未过，一切 tmp 是未提交垃圾 → 删除回滚。
     //   规则 2：原始不全而 tmp 对齐全有效 → D1 已过、只剩改名未完 → 补齐改名续做。
     //   其余（原始已删而 tmp 对缺失/损坏）→ 外部破坏或介质故障 → 明确报错。
+    // 调用时索引通道已打开并持有独占锁；需要改名 / 删除索引文件的分支先让锁关通道
+    // （Windows 上被占用且加锁的文件无法改名），完成后重新打开并取锁。
     // ==================================================================
 
     private void recoverCommitLine() throws IOException {
@@ -261,7 +302,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
         if (hasIndex && hasData) {
             // 规则 1：双原始齐 → 回滚。tmp 对即使完整也不采用：其中可能含未向调用方
-            // 应答过的写入，续做会违背原子性。
+            // 应答过的写入，续做会违背原子性。只删 tmp，不碰原始，无需让锁。
             boolean rolledBack = Files.deleteIfExists(iTmp) | Files.deleteIfExists(dTmp);
             if (rolledBack) {
                 recoveredFromCrash = true;
@@ -272,8 +313,11 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if (!hasIndex && !hasData) {
             if (tmpPairValid(iTmp, dTmp)) {
                 // 快照 {index.tmp, data.tmp}：D2 之后 → 补齐 R1 + R2。
-                Files.move(iTmp, path);
-                Files.move(dTmp, dataFile);
+                withIndexChannelClosed(() -> {
+                    // REPLACE_EXISTING：占锁时已顺带创建 0 字节索引占位文件，改名覆盖它。
+                    Files.move(iTmp, path, StandardCopyOption.REPLACE_EXISTING);
+                    Files.move(dTmp, dataFile);
+                });
                 recoveredFromCrash = true;
                 return;
             }
@@ -285,7 +329,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
 
         if (hasIndex) {
-            // 快照 {原索引(新), data.tmp}：R1 之后 → 补齐 R2。
+            // 快照 {原索引(新), data.tmp}：R1 之后 → 补齐 R2（只动数据文件，不碰索引）。
             if (Files.exists(dTmp)) {
                 deleteQuietly(iTmp);   // 协议上此时 iTmp 已被 R1 消耗，防御性清理
                 Files.move(dTmp, dataFile);
@@ -298,9 +342,11 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         // 索引缺失、原数据(旧)还在
         if (tmpPairValid(iTmp, dTmp)) {
             // 快照 {旧数据, index.tmp, data.tmp}：D1 之后 → 旧数据成垃圾，补齐 R1 + R2。
-            Files.delete(dataFile);
-            Files.move(iTmp, path);
-            Files.move(dTmp, dataFile);
+            withIndexChannelClosed(() -> {
+                Files.delete(dataFile);
+                Files.move(iTmp, path, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(dTmp, dataFile);
+            });
             recoveredFromCrash = true;
             return;
         }
@@ -313,6 +359,20 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
         // 只剩一个 0 字节的旧数据文件且无任何可引用内容：视为可重建现场。
         Files.delete(dataFile);
+    }
+
+    /** 恢复期改名 / 删除索引文件时临时让出通道与独占锁，做完立即重新打开取回。 */
+    private void withIndexChannelClosed(IoOp op) throws IOException {
+        closeIndexChannel();
+        try {
+            op.run();
+        } finally {
+            openIndexFile();
+        }
+    }
+
+    private interface IoOp {
+        void run() throws IOException;
     }
 
     /** 校验 index.tmp + data.tmp 是否是一份写完的配对（头合法 + CRC + 数据长度与头一致）。 */
@@ -385,6 +445,41 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     private void openIndexFile() throws IOException {
         indexRaf = new RandomAccessFile(path.toFile(), "rw");
         index = indexRaf.getChannel();
+        acquireIndexLock();
+    }
+
+    /**
+     * 对索引通道取独占锁，确立「一组文件同一时刻只有一个进程实例」的协议前提。
+     * 同进程内重复加锁会抛 {@link OverlappingFileLockException}（FileChannel 语义），
+     * 统一转成带路径的 {@link IOException}。
+     */
+    private void acquireIndexLock() throws IOException {
+        try {
+            FileLock fl = index.tryLock(0, Long.MAX_VALUE, false);
+            if (fl == null) {
+                throw new IOException("这组文件已被其它进程打开（无法取得独占锁）: " + path);
+            }
+            indexLock = fl;
+        } catch (OverlappingFileLockException e) {
+            throw new IOException("这组文件已在本进程内被打开（无法重复取得独占锁）: " + path, e);
+        }
+    }
+
+    /** 释放索引通道与独占锁（锁必须先于通道释放，通道关闭也会隐式释放锁）。 */
+    private void closeIndexChannel() throws IOException {
+        if (indexLock != null) {
+            try {
+                indexLock.release();
+            } catch (OverlappingFileLockException | ClosedChannelException ignore) {
+                // 通道已失效时锁已随句柄释放，无需处理
+            }
+            indexLock = null;
+        }
+        if (indexRaf != null) {
+            indexRaf.close();
+            indexRaf = null;
+            index = null;
+        }
     }
 
     private void openDataFile(Path p) throws IOException {
@@ -397,11 +492,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     }
 
     private void closeChannels() throws IOException {
-        if (indexRaf != null) {
-            indexRaf.close();
-            indexRaf = null;
-            index = null;
-        }
+        closeIndexChannel();
         if (dataRaf != null) {
             dataRaf.close();
             dataRaf = null;
@@ -425,7 +516,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         modCount = 0;
 
         dataPath = dataFileFor(path);
-        openIndexFile();
+        // 索引通道已由构造器打开并取到独占锁，这里只重置内容，不重复打开（同通道重复加锁会抛）。
         openDataFile(dataPath);
         index.truncate(0);
         data.truncate(0);
@@ -442,28 +533,30 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     // ==================================================================
 
     private void loadHeader() throws IOException {
-        readAt(index, 0, headerBytes, 0, HEADER_SIZE);
-        headerBuf.clear();
+        byte[] hb = headerBytes.get();
+        ByteBuffer hbuf = headerBuf.get();
+        readAt(index, 0, hb, 0, HEADER_SIZE);
+        hbuf.clear();
         for (int i = 0; i < MAGIC.length; i++) {
-            if (headerBytes[i] != MAGIC[i]) {
+            if (hb[i] != MAGIC[i]) {
                 throw new IOException("不是 FileBackedMap 索引文件: " + path);
             }
         }
-        int version = headerBuf.getInt(4);
+        int version = hbuf.getInt(4);
         if (version != FORMAT_VERSION) {
             throw new IOException("不支持的格式版本: " + version
                     + "（当前格式版本为 " + FORMAT_VERSION + "，索引 + 数据双文件布局）");
         }
-        slotCount = headerBuf.getInt(H_SLOTS);
-        entryCount = headerBuf.getInt(H_ENTRIES);
-        tombstoneCount = headerBuf.getInt(H_TOMB);
-        flags = headerBuf.getInt(H_FLAGS);
-        dataEnd = headerBuf.getLong(H_DATA_END);
-        garbageBytes = headerBuf.getLong(H_GARBAGE);
-        int storedCrc = headerBuf.getInt(H_CRC);
+        slotCount = hbuf.getInt(H_SLOTS);
+        entryCount = hbuf.getInt(H_ENTRIES);
+        tombstoneCount = hbuf.getInt(H_TOMB);
+        flags = hbuf.getInt(H_FLAGS);
+        dataEnd = hbuf.getLong(H_DATA_END);
+        garbageBytes = hbuf.getLong(H_GARBAGE);
+        int storedCrc = hbuf.getInt(H_CRC);
 
         CRC32 c = new CRC32();
-        c.update(headerBytes, 0, CRC_SPAN);
+        c.update(hb, 0, CRC_SPAN);
         crcValid = storedCrc == (int) c.getValue();
 
         if (slotCount < MIN_SLOTS || (slotCount & (slotCount - 1)) != 0) {
@@ -517,13 +610,16 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
     /** 手动把两个文件都刷到磁盘（顺序：数据 → 索引）。close() 已包含同等动作。 */
     private void flush() {
-        synchronized (this) {
+        writeLock.lock();
+        try {
             try {
                 data.force(false);
                 index.force(false);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -586,11 +682,12 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     }
 
     private int readInt(long pos) throws IOException {
-        readAt(data, pos, intBytes, 0, 4);
-        return ((intBytes[0] & 0xFF) << 24)
-                | ((intBytes[1] & 0xFF) << 16)
-                | ((intBytes[2] & 0xFF) << 8)
-                | (intBytes[3] & 0xFF);
+        byte[] ib = intBytes.get();
+        readAt(data, pos, ib, 0, 4);
+        return ((ib[0] & 0xFF) << 24)
+                | ((ib[1] & 0xFF) << 16)
+                | ((ib[2] & 0xFF) << 8)
+                | (ib[3] & 0xFF);
     }
 
     // ==================================================================
@@ -604,23 +701,26 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     }
 
     private Slot readSlot(int i) throws IOException {
-        readAt(index, HEADER_SIZE + (long) i * SLOT_SIZE, slotBytes, 0, SLOT_SIZE);
-        slotBuf.clear();
-        byte state = slotBuf.get();
-        slotBuf.get(); slotBuf.get(); slotBuf.get();
-        int hash = slotBuf.getInt();
-        long offset = slotBuf.getLong();
+        byte[] sb = slotBytes.get();
+        ByteBuffer sbuf = slotBuf.get();
+        readAt(index, HEADER_SIZE + (long) i * SLOT_SIZE, sb, 0, SLOT_SIZE);
+        sbuf.clear();
+        byte state = sbuf.get();
+        sbuf.get(); sbuf.get(); sbuf.get();
+        int hash = sbuf.getInt();
+        long offset = sbuf.getLong();
         return new Slot(state, hash, offset);
     }
 
     private void writeSlot(int i, byte state, int hash, long offset) throws IOException {
-        slotBuf.clear();
-        slotBuf.put(state);
-        slotBuf.put((byte) 0).put((byte) 0).put((byte) 0);
-        slotBuf.putInt(hash);
-        slotBuf.putLong(offset);
-        slotBuf.flip();
-        writeAt(index, HEADER_SIZE + (long) i * SLOT_SIZE, slotBuf);
+        ByteBuffer sbuf = slotBuf.get();
+        sbuf.clear();
+        sbuf.put(state);
+        sbuf.put((byte) 0).put((byte) 0).put((byte) 0);
+        sbuf.putInt(hash);
+        sbuf.putLong(offset);
+        sbuf.flip();
+        writeAt(index, HEADER_SIZE + (long) i * SLOT_SIZE, sbuf);
     }
 
     // ==================================================================
@@ -635,12 +735,14 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if (keyLen != keyBytes.length) {
             return false;
         }
-        if (compareBuffer.length < keyLen) {
-            compareBuffer = new byte[keyLen];
+        byte[] cb = compareBuffer.get();
+        if (cb.length < keyLen) {
+            cb = new byte[keyLen];
+            compareBuffer.set(cb);
         }
-        readAt(offset + 4, compareBuffer, 0, keyLen);
+        readAt(offset + 4, cb, 0, keyLen);
         for (int i = 0; i < keyLen; i++) {
-            if (compareBuffer[i] != keyBytes[i]) {
+            if (cb[i] != keyBytes[i]) {
                 return false;
             }
         }
@@ -1067,12 +1169,15 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     }
 
     private void compact() {
-        synchronized (this) {
+        writeLock.lock();
+        try {
             try {
                 rebuild(Math.max(MIN_SLOTS, slotCount), true);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1147,9 +1252,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
 
         // ---- 3) 单点提交：重命名索引；数据文件全程原封不动，不受影响 ----
-        indexRaf.close();
-        indexRaf = null;
-        index = null;
+        closeIndexChannel();
         try {
             Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
         } catch (IOException e) {
@@ -1298,15 +1401,21 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
     @Override
     public int size() {
-        synchronized (this) {
+        readLock.lock();
+        try {
             return entryCount;
+        } finally {
+            readLock.unlock();
         }
     }
 
     @Override
     public boolean isEmpty() {
-        synchronized (this) {
+        readLock.lock();
+        try {
             return entryCount == 0;
+        } finally {
+            readLock.unlock();
         }
     }
 
@@ -1315,13 +1424,16 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if (key != null && !(key instanceof String)) {
             return false;
         }
-        synchronized (this) {
+        readLock.lock();
+        try {
             try {
                 byte[] kb = key == null ? null : ((String) key).getBytes(UTF8);
                 return findSlotIndex(hashBytes(kb), kb) >= 0;
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            readLock.unlock();
         }
     }
 
@@ -1331,7 +1443,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             return false;
         }
         byte[] target = value == null ? null : ((String) value).getBytes(UTF8);
-        synchronized (this) {
+        readLock.lock();
+        try {
             try {
                 for (int i = 0; i < slotCount; i++) {
                     Slot s = readSlot(i);
@@ -1361,6 +1474,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            readLock.unlock();
         }
         return false;
     }
@@ -1370,7 +1485,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if (key != null && !(key instanceof String)) {
             return null;
         }
-        synchronized (this) {
+        readLock.lock();
+        try {
             try {
                 byte[] kb = key == null ? null : ((String) key).getBytes(UTF8);
                 int idx = findSlotIndex(hashBytes(kb), kb);
@@ -1378,6 +1494,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            readLock.unlock();
         }
     }
 
@@ -1393,13 +1511,16 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
     @Override
     public String put(String key, String value) {
-        synchronized (this) {
+        writeLock.lock();
+        try {
             try {
                 return putInternal(key == null ? null : key.getBytes(UTF8),
                         value == null ? null : value.getBytes(UTF8));
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1408,12 +1529,15 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if (key != null && !(key instanceof String)) {
             return null;
         }
-        synchronized (this) {
+        writeLock.lock();
+        try {
             try {
                 return removeInternal(key == null ? null : ((String) key).getBytes(UTF8));
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1422,7 +1546,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if ((key != null && !(key instanceof String)) || (value != null && !(value instanceof String))) {
             return false;
         }
-        synchronized (this) {
+        writeLock.lock();
+        try {
             if (!containsKey(key)) {
                 return false;
             }
@@ -1431,6 +1556,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             }
             remove(key);
             return true;
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1444,54 +1571,67 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
     @Override
     public void clear() {
-        synchronized (this) {
+        writeLock.lock();
+        try {
             try {
                 rebuild(MIN_SLOTS, false);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public String putIfAbsent(String key, String value) {
-        synchronized (this) {
+        writeLock.lock();
+        try {
             String oldValue = get(key);
             if (oldValue == null) {
                 put(key, value);
                 return null;
             }
             return oldValue;
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public boolean replace(String key, String oldValue, String newValue) {
-        synchronized (this) {
+        writeLock.lock();
+        try {
             if (!containsKey(key) || !Objects.equals(get(key), oldValue)) {
                 return false;
             }
             put(key, newValue);
             return true;
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public String replace(String key, String value) {
-        synchronized (this) {
+        writeLock.lock();
+        try {
             if (!containsKey(key)) {
                 return null;
             }
             String old = get(key);
             put(key, value);
             return old;
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public String compute(String key, BiFunction<? super String, ? super String, ? extends String> f) {
         Objects.requireNonNull(f, "remappingFunction");
-        synchronized (this) {
+        writeLock.lock();
+        try {
             String oldValue = get(key);
             String newValue = f.apply(key, oldValue);
             if (newValue == null) {
@@ -1500,13 +1640,16 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             }
             put(key, newValue);
             return newValue;
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public String computeIfAbsent(String key, Function<? super String, ? extends String> f) {
         Objects.requireNonNull(f, "mappingFunction");
-        synchronized (this) {
+        writeLock.lock();
+        try {
             String oldValue = get(key);
             if (oldValue != null) {
                 return oldValue;
@@ -1516,13 +1659,16 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                 put(key, newValue);
             }
             return newValue;
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public String computeIfPresent(String key, BiFunction<? super String, ? super String, ? extends String> f) {
         Objects.requireNonNull(f, "remappingFunction");
-        synchronized (this) {
+        writeLock.lock();
+        try {
             String oldValue = get(key);
             if (oldValue == null) {
                 return null;
@@ -1534,6 +1680,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             }
             put(key, newValue);
             return newValue;
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1541,7 +1689,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     public String merge(String key, String value,
                         BiFunction<? super String, ? super String, ? extends String> f) {
         Objects.requireNonNull(f, "remappingFunction");
-        synchronized (this) {
+        writeLock.lock();
+        try {
             String oldValue = get(key);
             String newValue = (oldValue == null) ? value : f.apply(oldValue, value);
             if (newValue == null) {
@@ -1550,6 +1699,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             }
             put(key, newValue);
             return newValue;
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1560,7 +1711,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     @Override
     public void forEach(BiConsumer<? super String, ? super String> action) {
         Objects.requireNonNull(action, "action");
-        synchronized (this) {
+        writeLock.lock();
+        try {
             int expected = modCount;
             try {
                 for (int i = 0; i < slotCount; i++) {
@@ -1577,13 +1729,16 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
     @Override
     public void replaceAll(BiFunction<? super String, ? super String, ? extends String> f) {
         Objects.requireNonNull(f, "function");
-        synchronized (this) {
+        writeLock.lock();
+        try {
             int expected = modCount;
             try {
                 for (int i = 0; i < slotCount; i++) {
@@ -1632,6 +1787,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -1664,32 +1821,43 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         private boolean lastReady;
 
         DiskIterator() {
-            advance();
+            readLock.lock();
+            try {
+                expected = modCount;
+                advance();
+            } finally {
+                readLock.unlock();
+            }
         }
 
         protected abstract T create(String key, String value);
 
         private void advance() {
-            if (modCount != expected) {
-                throw new ConcurrentModificationException();
-            }
+            readLock.lock();
             try {
-                while (scanIndex < slotCount) {
-                    Slot s = readSlot(scanIndex);
-                    if (s.state == ST_OCCUPIED) {
-                        Record r = readRecordAt(s.offset);
-                        nextSlot = scanIndex;
-                        nextKey = r.key();
-                        nextValue = r.value();
-                        scanIndex++;
-                        return;
-                    }
-                    scanIndex++;
+                if (modCount != expected) {
+                    throw new ConcurrentModificationException();
                 }
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
+                try {
+                    while (scanIndex < slotCount) {
+                        Slot s = readSlot(scanIndex);
+                        if (s.state == ST_OCCUPIED) {
+                            Record r = readRecordAt(s.offset);
+                            nextSlot = scanIndex;
+                            nextKey = r.key();
+                            nextValue = r.value();
+                            scanIndex++;
+                            return;
+                        }
+                        scanIndex++;
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+                nextSlot = -1;
+            } finally {
+                readLock.unlock();
             }
-            nextSlot = -1;
         }
 
         @Override
@@ -1714,6 +1882,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             if (!lastReady) {
                 throw new IllegalStateException("next() 还没被调用，或当前元素已被删除");
             }
+            writeLock.lock();
             try {
                 byte[] kb = lastKey == null ? null : lastKey.getBytes(UTF8);
                 removeInternal(kb, false);
@@ -1722,6 +1891,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                 lastReady = false;
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
+            } finally {
+                writeLock.unlock();
             }
         }
     }
@@ -1752,10 +1923,13 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             if (o != null && !(o instanceof String)) {
                 return false;
             }
-            synchronized (FileBackedMap.this) {
+            writeLock.lock();
+            try {
                 boolean existed = FileBackedMap.this.containsKey(o);
                 FileBackedMap.this.remove(o);
                 return existed;
+            } finally {
+                writeLock.unlock();
             }
         }
 
@@ -1818,11 +1992,14 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             if ((k != null && !(k instanceof String)) || (v != null && !(v instanceof String))) {
                 return false;
             }
-            synchronized (FileBackedMap.this) {
+            writeLock.lock();
+            try {
                 if (!containsKey(k)) {
                     return false;
                 }
                 return Objects.equals(get(k), v);
+            } finally {
+                writeLock.unlock();
             }
         }
 
@@ -1861,7 +2038,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
         @Override
         public String setValue(String newValue) {
-            synchronized (FileBackedMap.this) {
+            writeLock.lock();
+            try {
                 try {
                     String old = putInternal(key == null ? null : key.getBytes(UTF8),
                             newValue == null ? null : newValue.getBytes(UTF8), false);
@@ -1870,6 +2048,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
                 }
+            } finally {
+                writeLock.unlock();
             }
         }
 
@@ -1907,7 +2087,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         if (other.size() != size()) {
             return false;
         }
-        synchronized (this) {
+        readLock.lock();
+        try {
             for (Map.Entry<String, String> e : entrySet()) {
                 String k = e.getKey();
                 Object ov = other.get(k);
@@ -1918,25 +2099,31 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                     return false;
                 }
             }
+        } finally {
+            readLock.unlock();
         }
         return true;
     }
 
     @Override
     public int hashCode() {
-        synchronized (this) {
+        readLock.lock();
+        try {
             int h = 0;
             for (Map.Entry<String, String> e : entrySet()) {
                 h += (e.getKey() == null ? 0 : e.getKey().hashCode())
                         ^ (e.getValue() == null ? 0 : e.getValue().hashCode());
             }
             return h;
+        } finally {
+            readLock.unlock();
         }
     }
 
     @Override
     public String toString() {
-        synchronized (this) {
+        readLock.lock();
+        try {
             StringBuilder sb = new StringBuilder("{");
             boolean first = true;
             for (Map.Entry<String, String> e : entrySet()) {
@@ -1947,6 +2134,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                 first = false;
             }
             return sb.append('}').toString();
+        } finally {
+            readLock.unlock();
         }
     }
 
@@ -1955,7 +2144,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     // ==================================================================
 
     private Stats stats() {
-        synchronized (this) {
+        readLock.lock();
+        try {
             double load = slotCount == 0 ? 0 : (double) (entryCount + tombstoneCount) / slotCount;
             long idxBytes;
             long datBytes;
@@ -1968,6 +2158,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
             return new Stats(path.toString(), dataPath.toString(), slotCount, entryCount,
                     tombstoneCount, idxBytes, datBytes, garbageBytes, load, modCount,
                     recoveredFromCrash, droppedOnRecovery, (flags & FLAG_DIRTY) != 0);
+        } finally {
+            readLock.unlock();
         }
     }
 
@@ -1991,26 +2183,34 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    /** 正常关闭：清除脏标记 → 落盘 → 关闭。下次打开即视为一致状态，不做对账。 */
+    /**
+     * 正常关闭：清除脏标记 → 落盘 → 释放独占锁并关闭通道。下次打开即视为一致状态，不做对账。
+     *
+     * <p>这里的 force 是<b>无条件</b>的，与 {@code durable} 无关：close 是会话收尾的提交点，
+     * 它落盘的「脏标记已清零」决定了下次打开是否触发对账。若受 durable 门控，非 durable 模式下
+     * close 的清零可能留在页缓存里——进程退出后磁盘上仍是脏标记，下次打开被误判为崩溃现场。
+     * {@code durable} 只描述运行期逐次写入的持久化档位，不适用于会话收尾。
+     */
     @Override
     public void close() {
-        synchronized (this) {
+        writeLock.lock();
+        try {
+            if (index == null) {
+                return;
+            }
             try {
-                if (index == null) {
-                    return;
-                }
                 if ((flags & FLAG_DIRTY) != 0) {
                     flags &= ~FLAG_DIRTY;
                     writeHeader();
                 }
-                if (durable) {
-                    data.force(false);
-                    index.force(false);
-                }
+                data.force(false);
+                index.force(false);
                 closeChannels();
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 }
