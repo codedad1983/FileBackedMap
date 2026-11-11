@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>P4 并发读互不干扰：共享缓冲已线程私有，多线程同时读不同键结果全部正确。</li>
  *   <li>P5 回调重入不死锁：forEach / compute 的回调里再调用本实例方法（写锁可重入）。</li>
  *   <li>P6 迭代器并发扫描：两个线程同时遍历，各自得到完整一致的快照。</li>
- *   <li>P7 close() 无条件落盘：非 durable 模式下 close 后磁盘上的脏标记必须已清零。</li>
+ *   <li>P7 close() 无条件落盘：close 后磁盘上的脏标记必须已清零。</li>
  * </ul>
  */
 final class ConcurrencyTest {
@@ -409,19 +409,19 @@ final class ConcurrencyTest {
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("P7 非 durable 模式 close 后，磁盘上的脏标记已清零（close 无条件 force）")
-    void closeFlushesDirtyFlagRegardlessOfDurable() throws IOException {
+    @DisplayName("P7 close 后，磁盘上的脏标记已清零（close 无条件 force）")
+    void closeFlushesDirtyFlag() throws IOException {
         Path p = fresh(dir, "closedurable.fbmap");
-        try (FileBackedMap m = new FileBackedMap(p, false)) {   // durable=false
+        try (FileBackedMap m = new FileBackedMap(p)) {
             m.put("a", "1");
             m.put("b", "2");
             // 会话进行中的脏标记由 CrashSafetyTest 的 dirty() 断言覆盖；
             // 这里不能直接读索引文件——独占锁在 Windows 上会挡住外部读取。
         }
-        assertEquals(0, flagsOnDisk(p) & 1, "close 后磁盘上的脏标记必须为 0（与 durable 无关）");
+        assertEquals(0, flagsOnDisk(p) & 1, "close 后磁盘上的脏标记必须为 0");
 
         // 重开不应触发对账，数据完好
-        try (FileBackedMap m = new FileBackedMap(p, false)) {
+        try (FileBackedMap m = new FileBackedMap(p)) {
             assertEquals(2, m.size());
             assertEquals("1", m.get("a"));
             assertEquals("2", m.get("b"));

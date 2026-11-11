@@ -333,7 +333,7 @@ final class FileBackedMapTest {
     void churnAndStress() throws IOException {
         Path p = fresh(dir, "stress.fbmap");
         HashMap<String, String> ref = new HashMap<>();
-        try (FileBackedMap m = new FileBackedMap(p, true)) {   // durable=true，顺便验证 fsync 路径
+        try (FileBackedMap m = new FileBackedMap(p)) {   // 顺便验证逐次 fsync 落盘路径
             for (int i = 0; i < 2000; i++) {
                 String k = "k" + i;
                 String v = "x".repeat(64);
@@ -374,7 +374,7 @@ final class FileBackedMapTest {
             assertEquals(ref.hashCode(), m.hashCode(), "混合后 hashCode 一致");
         }
 
-        // 重新打开再核对一次（durable 写入应完整）
+        // 重新打开再核对一次（fsync 落盘应完整）
         try (FileBackedMap m = new FileBackedMap(p)) {
             assertEquals(ref, new HashMap<>(m), "重开后内容一致");
             assertEquals(ref.size(), m.size(), "重开后 size");

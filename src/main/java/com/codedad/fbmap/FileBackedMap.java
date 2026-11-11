@@ -163,7 +163,6 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     // ================= 实例状态 =================
     private final Path path;       // 索引文件
     private Path dataPath;         // 当前使用的数据文件（固定名 &lt;path&gt;.data，永不改名）
-    private final boolean durable;
 
     private RandomAccessFile indexRaf;
     private FileChannel index;
@@ -213,13 +212,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     // ==================================================================
 
     public FileBackedMap(Path path) throws IOException {
-        this(path, false);
-    }
-
-    public FileBackedMap(Path path, boolean durable) throws IOException {
         Objects.requireNonNull(path, "path");
         this.path = path.toAbsolutePath();
-        this.durable = durable;
 
         Path parent = this.path.getParent();
         if (parent != null) {
@@ -268,9 +262,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                 reconcile();
             } else {
                 writeHeader();
-                if (durable) {
-                    index.force(false);
-                }
+                index.force(false);
             }
 
             if (overloaded() || garbageFull()) {
@@ -522,10 +514,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         data.truncate(0);
         extendChannel(index, (long) HEADER_SIZE + (long) slotCount * SLOT_SIZE);
         writeHeader();
-        if (durable) {
-            index.force(false);
-            data.force(false);
-        }
+        index.force(false);
+        data.force(false);
     }
 
     // ==================================================================
@@ -601,11 +591,9 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     }
 
     /** 数据先落盘、索引后落盘：这样索引指向的记录一定已经持久化。 */
-    private void syncIfDurable() throws IOException {
-        if (durable) {
-            data.force(false);
-            index.force(false);
-        }
+    private void syncAll() throws IOException {
+        data.force(false);
+        index.force(false);
     }
 
     private Path path() {
@@ -969,17 +957,13 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
             // 1) 追加新记录（只推进游标）
             long newOffset = appendRecord(keyBytes, valueBytes);
-            // 2) durable 时先把记录字节刷到磁盘，再发布槽位
-            if (durable) {
-                data.force(false);
-            }
+            // 2) 先把记录字节刷到磁盘，再发布槽位
+            data.force(false);
             // 3) 发布槽位
             writeSlot(foundIndex, ST_OCCUPIED, hash, newOffset);
             // 4) 最后更新头（计数器）
             writeHeader();
-            if (durable) {
-                index.force(false);
-            }
+            index.force(false);
             if (allowMaintain) {
                 maintain();
             }
@@ -988,9 +972,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
         // 新键：追加记录 → 发布槽位（复用第一个墓碑或探测末尾的空槽）
         long newOffset = appendRecord(keyBytes, valueBytes);
-        if (durable) {
-            data.force(false);
-        }
+        data.force(false);
         int target = (firstTomb >= 0) ? firstTomb : i;
         if (firstTomb >= 0) {
             tombstoneCount--;
@@ -999,9 +981,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         entryCount++;
         modCount++;
         writeHeader();
-        if (durable) {
-            index.force(false);
-        }
+        index.force(false);
         if (allowMaintain) {
             maintain();
         }
@@ -1025,9 +1005,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                 entryCount--;
                 modCount++;
                 writeHeader();
-                if (durable) {
-                    index.force(false);
-                }
+                index.force(false);
                 if (allowMaintain) {
                     maintain();
                 }
@@ -1113,9 +1091,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         droppedOnRecovery = dropped;
 
         writeHeader();
-        if (durable) {
-            index.force(false);
-        }
+        index.force(false);
     }
 
     // ==================================================================
@@ -1216,7 +1192,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
             writeHeaderTo(out, newSlotCount, entryCount, 0, dataEnd, garbageBytes,
                     flags | FLAG_DIRTY);
-            // 改名会覆盖旧索引、销毁回滚材料，改名前新内容必须无条件落盘（与 durable 无关）：
+            // 改名会覆盖旧索引、销毁回滚材料，改名前新内容必须落盘：
             // 对账只能丢弃悬空槽位，无法重建槽位→记录的映射，落盘不全的槽位区不可恢复。
             out.force(false);
         }
@@ -1310,7 +1286,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                     }
                 }
             }
-            // W1 必须无条件落盘，与 durable 无关：D1 一旦删掉原始对，data.tmp 就是
+            // W1 必须落盘：D1 一旦删掉原始对，data.tmp 就是
             // 存活记录的唯一副本；未落盘时崩溃会让「tmp 对齐全」的前提失效，恢复无法续做。
             outData.force(false);
         }
@@ -1746,13 +1722,11 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                     // 一律追加，不原地覆盖（避免撕裂记录）
                     garbageBytes += RECORD_OVERHEAD + Math.max(keyLen, 0) + Math.max(valLen, 0);
                     long newOffset = appendRecord(kb, nb);
-                    if (durable) {
-                        data.force(false);
-                    }
+                    data.force(false);
                     writeSlot(i, ST_OCCUPIED, s.hash, newOffset);
                 }
                 writeHeader();
-                syncIfDurable();
+                syncAll();
                 maintain();
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
@@ -2156,10 +2130,8 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     /**
      * 正常关闭：清除脏标记 → 落盘 → 释放独占锁并关闭通道。下次打开即视为一致状态，不做对账。
      *
-     * <p>这里的 force 是<b>无条件</b>的，与 {@code durable} 无关：close 是会话收尾的提交点，
-     * 它落盘的「脏标记已清零」决定了下次打开是否触发对账。若受 durable 门控，非 durable 模式下
-     * close 的清零可能留在页缓存里——进程退出后磁盘上仍是脏标记，下次打开被误判为崩溃现场。
-     * {@code durable} 只描述运行期逐次写入的持久化档位，不适用于会话收尾。
+     * <p>close 是会话收尾的提交点，它落盘的「脏标记已清零」决定了下次打开是否触发对账：
+     * 若清零留在页缓存里，进程退出后磁盘上仍是脏标记，下次打开会被误判为崩溃现场。
      */
     @Override
     public void close() {
