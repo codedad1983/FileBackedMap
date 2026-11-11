@@ -608,21 +608,6 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         }
     }
 
-    /** 手动把两个文件都刷到磁盘（顺序：数据 → 索引）。close() 已包含同等动作。 */
-    private void flush() {
-        writeLock.lock();
-        try {
-            try {
-                data.force(false);
-                index.force(false);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
-        } finally {
-            writeLock.unlock();
-        }
-    }
-
     private Path path() {
         return path;
     }
@@ -776,21 +761,6 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         byte[] vb = new byte[valLen];
         readAt(vp + 4, vb, 0, valLen);
         return new String(vb, UTF8);
-    }
-
-    /** 读取值字节；返回 {@code null} 表示 null 值，返回长度为 0 的数组表示空串。 */
-    private byte[] readValueBytesAt(long offset) throws IOException {
-        int keyLen = readInt(offset);
-        long vp = offset + 4 + Math.max(keyLen, 0);
-        int valLen = readInt(vp);
-        if (valLen == -1) {
-            return null;
-        }
-        byte[] vb = new byte[valLen];
-        if (valLen > 0) {
-            readAt(vp + 4, vb, 0, valLen);
-        }
-        return vb;
     }
 
     private Record readRecordAt(long offset) throws IOException {

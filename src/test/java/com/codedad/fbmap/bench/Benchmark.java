@@ -220,7 +220,6 @@ public final class Benchmark {
                     + heapStart / 1048576 + " MB)");
             System.out.println("FINAL heapPeak  = " + monitor.peak() / 1048576 + " MB");
             monitor.stopMonitor();
-            BenchInternals.flush(map);
         }
         monitor.stopMonitor();
     }

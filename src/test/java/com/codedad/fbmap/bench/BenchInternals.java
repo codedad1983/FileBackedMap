@@ -55,10 +55,6 @@ final class BenchInternals {
         call(m, "compact");
     }
 
-    static void flush(FileBackedMap m) {
-        call(m, "flush");
-    }
-
     static int slots(FileBackedMap m) {
         return (int) stat(m, "slots");
     }

@@ -172,7 +172,6 @@ fsync 分三类，语义不同：
 - **常规写路径（受 `durable` 开关控制）**：`durable=true` 时，每次写操作按 **data.force → index.force** 顺序落盘——索引（指向记录）永远最后持久，因此不可能出现「索引已持久、记录未持久」的组合。`durable=false` 时把逐次 fsync 的开销交给 OS 页缓存，崩溃后的丢数据窗口由脏标记 + 对账兜底（见 5.3）。
 - **提交线的 W1/W2 与 close()（无条件 fsync，与 `durable` 无关）**：`data.tmp` 与 `index.tmp` 写完必须立即 `force` 再到 D1。原因：D1 删掉原始对之后，两个 tmp 是数据的**唯一副本**，恢复规则②要靠 `index.tmp` 头的 `dataEnd` 对上 `data.tmp` 的实际长度才能续做——若此时内容还停在页缓存里，「tmp 对齐全有效」的前提失效，恢复会失败。同理 `close()` 是会话收尾的提交点，它落盘的「脏标记已清零」决定下次打开是否触发对账，所以两个 `force` 也**无条件**执行。原子性与会话收尾都是协议正确性，不属于可降级的持久化档位。扩容改名前对新索引的 `force` 同理（改名销毁回滚材料）。
 - 会话打开即把脏标记写入磁盘；`close()` 清除它再落盘。若进程被强杀，标记仍在 → 下次打开对账。
-- 内部 `flush()` 在每次需要时把两个文件刷到磁盘（同样 data → index），不对用户暴露。
 
 ### 5.5 校验与报错边界
 
@@ -258,7 +257,7 @@ mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.bench.Benchmark \
 import com.codedad.fbmap.FileBackedMap;
 
 // 对外 API 只有 java.util.Map 接口方法 + close()，其余（文件路径、
-// 统计、compact、flush）全部是 private，用户拿到的就是一个纯粹的 Map。
+// 统计、compact）全部是 private，用户拿到的就是一个纯粹的 Map。
 try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
     map.put("name", "张三");
     map.put("note", "x".repeat(1_000_000));  // 长度不限
