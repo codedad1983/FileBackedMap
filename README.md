@@ -6,13 +6,13 @@
 
 - 仓库：<https://github.com/codedad1983/FileBackedMap>
 - 发布页：<https://github.com/codedad1983/FileBackedMap/releases>（推送 `v*` 标签自动构建发布 `filebackedmap-<版本>.jar` 与 `-sources.jar`）
-- 坐标：`com.codedad:filebackedmap:0.0.1`（Java 17+；生产代码零第三方依赖，测试用 JUnit 5，另有 MapDB 仅作性能对照组）
+- 坐标：`com.codedad:filebackedmap:0.0.1`（Java 17+；生产代码零第三方依赖，测试仅需 JUnit 5）
 
 ## 一、定位与会话生命周期
 
 组件被刻意定位为 **HashMap 的磁盘扩展**，不是嵌入式数据库：
 
-| 特性 | 本组件 | 嵌入式 DB（如 MapDB） |
+| 特性 | 本组件 | 嵌入式 DB |
 |---|---|---|
 | 数据存哪 | 数据文件（磁盘），索引在内存 | 文件 + 页缓存 / mmap |
 | 关闭后文件 | **删除**，数据不保留 | 保留，可重开 |
@@ -121,7 +121,6 @@ filebackedmap/
 │       ├── bench/                     ← 性能专项测试
 │       │   ├── Benchmark.java          ← 100 万条插入 / 修改 / 查找
 │       │   ├── PutAllBench.java       ← putAll 批量插入专项（对照逐条）
-│       │   ├── MapDbBenchmark.java    ← MapDB 对照组（相同场景）
 │       │   ├── GrowBench.java         ← 扩容专项（纯内存 rehash）
 │       │   ├── VerifyFinal.java      ← 写入-读回自校验 + 打开开销
 │       │   ├── BenchInternals.java    ← 专项测试辅助工具（仅 bench 内部使用）
@@ -339,32 +338,7 @@ java -Xmx256m -cp "$CP" com.codedad.fbmap.bench.VerifyFinal build/bench-data
 
 # 扩容专项（约 40 秒）
 java -Xmx256m -cp "$CP" com.codedad.fbmap.bench.GrowBench build/grow-data
-
-# MapDB 对照（非事务模式约 8 分钟；classpath 需带 MapDB 传递依赖）
-mvn -q dependency:build-classpath -Dmdep.outputFile=target/cp.txt
-CP="target/classes;target/test-classes;$(cat target/cp.txt)"
-java -Xmx256m -Dbench.mapdb.tx=false -cp "$CP" com.codedad.fbmap.bench.MapDbBenchmark mapdb build/bench-data
 ```
-
-### 9.11 与 MapDB 对照（同样 100 万条、同样样本、同为文件存储）
-
-MapDB 3.1.0（`HTreeMap`，单文件 + mmap，官方推荐的堆外大 Map 用法）是同类「Map 数据放磁盘文件」的成熟第三方实现，作为对照组。`com.codedad.fbmap.bench.MapDbBenchmark` 与 `Benchmark` 使用完全相同的样本（同一 `SampleGen`、同种子）、相同三阶段、相同 `-Xmx256m`（两者都不需要大堆）。
-
-**强度对齐说明**：本组件的写语义是「写进页缓存即返回」（无 fsync），MapDB 3.1 默认的非事务模式与此最接近（写入进 mmap，由 OS 择机刷盘，逐写不 fsync）。主对照取该模式：
-
-| 阶段 | FileBackedMap（会话模型） | MapDB 3.1.0（非事务） | 对比 |
-|---|---|---|---|
-| 插入 | **48,933 ops/s**（p50 6.5 µs） | 4,324 ops/s（p50 193.3 µs） | 本组件快 **11.3 倍** |
-| 修改 | **18,531 ops/s**（p50 32.8 µs） | 5,318 ops/s（p50 157.3 µs） | 本组件快 **3.5 倍** |
-| 查找 | **27,084 ops/s**（p50 25.7 µs） | 11,822 ops/s（p50 69.8 µs） | 本组件快 **2.3 倍** |
-| 磁盘 | 1,056 MB（插入阶段净载荷） | 1,124 MB（单文件） | 本组件小 6% |
-| 堆占用 | 29 MB（峰值 104 MB） | 11 MB（峰值 35 MB） | MapDB 略省（索引在 mmap 页里） |
-
-- 三阶段两边最终 size 均为 1,000,000、修改与查找命中均为 1,000,000 / 1,000,000（结果一致，仅速度不同）。
-- 写路径差距的来源：MapDB 每次 put 要走 Kryo 序列化 + 可变长度记录编码 + HTreeMap 桶定位（1,124 MB 文件上的随机写，mmap 页查找），p50 193 µs 反映的是随机写布局成本；本组件是纯顺序追加 + 内存索引探测，p50 6.5 µs。
-- 读路径本组件快 2.3 倍：内存索引探测（0～1 次哈希比较）+ 一次定位读，对 mmap 上的桶 + 链 + 变长记录解析。
-- **持久化强度参考**（历史实测，旧版本组件为逐写 2 fsync 时对照）：MapDB 事务模式（`transactionEnable()` + 逐写 `commit()`，WAL fsync）为 189 / 189 / 12,841 ops/s（commit p50 ≈ 5.1 ms）。会话模型无 fsync，与事务模式相差两个数量级——这正说明两者定位不同：**要逐写持久化选 MapDB 事务模式，要会话内高速读写选本组件**。
-- 语义差异：MapDB 提供事务、多 Map、并发容器、数据持久化等完整嵌入式 DB 能力；本组件刻意只做「会话作用域的磁盘内存 Map」这一件事。MapDB 以 `scope=test` 引入作为对照组依赖，不进入发布 jar。
 
 ## 十、已知取舍
 
