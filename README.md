@@ -111,8 +111,6 @@
 ```
 filebackedmap/
 ├── pom.xml
-├── docs/
-│   └── perf-plan.md                   ← 历史性能方案（持久化时代的 A/B/C，已被会话模型取代）
 ├── src/
 │   ├── main/java/com/codedad/fbmap/
 │   │   └── FileBackedMap.java          ← 组件主体（唯一的生产代码）
