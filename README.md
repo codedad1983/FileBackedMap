@@ -496,30 +496,34 @@ java -cp $CP com.codedad.fbmap.bench.GrowBench <copy-of>.fbmap
 # 整理耗时（可选，另建目录，不覆盖上面保留的文件；fsync 全开约 39 分钟，其中整理本身约 19.7 s）
 java -Xmx512m -Dbench.n=1000000 -cp $CP com.codedad.fbmap.bench.CompactBench build/compact-data
 
-# MapDB 对照（事务模式约 2 小时 45 分，持久化强度与本组件对齐；
-# 加 -Dbench.mapdb.tx=false 切到非事务模式约 8 分钟，仅作强度参考。
+# MapDB 对照（事务模式实测约 3 小时：插入 88 分 + 修改 88 分 + 查找 1.3 分，
+# 持久化强度与本组件对齐；加 -Dbench.mapdb.tx=false 切到非事务模式约 8 分钟，仅作强度参考。
 # classpath 需带上 MapDB 及其传递依赖，用 Maven 最省事）
 mvn -q test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 CP="target/classes;target/test-classes;$(cat target/cp.txt)"     # Windows 用 ; 分隔
 java -Xmx256m -cp "$CP" com.codedad.fbmap.bench.MapDbBenchmark mapdb build/bench-data
 ```
 
-### 9.11 与 MapDB 对照（同样 100 万条、同样样本、同为文件存储）
+### 9.11 与 MapDB 对照（同样 100 万条、同样样本、同为文件存储、同持久化强度）
 
 MapDB 3.1.0（`HTreeMap`，单文件 + mmap，官方推荐的堆外大 Map 用法）是同类「Map 数据放磁盘文件」的成熟第三方实现，作为对照组。`com.codedad.fbmap.bench.MapDbBenchmark` 与 `Benchmark` 使用完全相同的样本（同一 `SampleGen`、同种子）、相同三阶段、相同 `-Xmx256m`（两者都不需要大堆）。
 
-| 阶段 | FileBackedMap | MapDB 3.1.0 | 对比 |
-|---|---|---|---|
-| 插入 | 905 ops/s（p50 1,003 µs） | **4,584 ops/s**（p50 184.5 µs） | MapDB 快 5.1 倍 |
-| 修改 | 830 ops/s（p50 1,024 µs） | **5,571 ops/s**（p50 150.6 µs） | MapDB 快 6.7 倍 |
-| 查找 | **18,589 ops/s**（p50 43.3 µs） | 12,660 ops/s（p50 65.2 µs） | 本组件快 1.5 倍 |
-| 磁盘 | 1,088 MB（索引 32 + 数据 1,056） | 1,124 MB（单文件） | 本组件小 3.3% |
-| 堆占用 | 9 MB（峰值 96 MB） | 11 MB（峰值 36 MB） | 相当，都远低于同规模 HashMap 的 1,184 MB |
+对照组的持久化强度与本组件**对齐**：`MapDbBenchmark` 默认启用 MapDB **事务模式**（`transactionEnable()`，每次 `put` 后立即 `db.commit()`——事务模式下 commit 会把 WAL 记录 fsync 落盘才返回），与本组件「每写 data.force → index.force 落盘才返回」是同一强度。
 
-- 三阶段两边最终 size 均为 1,000,000、查找命中均为 1,000,000 / 1,000,000（结果一致，仅速度不同）。
-- **写路径 MapDB 领先的原因是持久化强度不同，不是结构优劣**：本组件每次写都执行两个 fsync（约 1 ms，实测 905 / 830 ops/s 已贴近「每写 2 fsync」的理论上限 ~1,000 ops/s）；MapDB 3.1 默认非事务模式**不做逐次 fsync**，写入只进 mmap 由 OS 择机刷盘，崩溃后不保证已应答的写不丢。也就是说，MapDB 的写优势是放弃了逐写持久化换来的。
-- 读路径本组件占优（1.5 倍）：两边都不涉及 fsync，纯比读布局 —— 开放寻址 1 次探测 + 定长定位读，对 HTreeMap 的桶 + 链 + mmap 页解析更快。
-- FileBackedMap 修改阶段 max 28.5 s 是一次自动垃圾整理重建（第四节）落在统计窗口内；MapDB insert max 155 ms 为其内部桶分裂。
+| 阶段 | FileBackedMap | MapDB 3.1.0（事务模式） | 对比 |
+|---|---|---|---|
+| 插入 | **905 ops/s**（p50 1,003 µs） | 189 ops/s（p50 5,106 µs） | 本组件快 **4.8 倍** |
+| 修改 | **830 ops/s**（p50 1,024 µs） | 189 ops/s（p50 5,106 µs） | 本组件快 **4.4 倍** |
+| 查找 | **18,589 ops/s**（p50 43.3 µs） | 12,841 ops/s（p50 66.0 µs） | 本组件快 **1.45 倍** |
+| 磁盘 | 1,088 MB（索引 32 + 数据 1,056） | 1,124 MB（单文件 + WAL 收尾合并） | 本组件小 3.2% |
+| 堆占用 | 9 MB（峰值 96 MB） | 11 MB（峰值 37 MB） | 相当，都远低于同规模 HashMap 的 1,184 MB |
+
+- 三阶段两边最终 size 均为 1,000,000、修改与查找命中均为 1,000,000 / 1,000,000（结果一致，仅速度不同）。
+- **同强度持久化下本组件写路径快 4.4–4.8 倍**：MapDB 事务模式每次 commit 的实测成本约 5.1 ms（p50），高于本组件两个 fsync 的约 1 ms——WAL 追加 + Kryo 序列化 + 事务日志 fsync 的固定开销显著。本组件 905 / 830 ops/s 已贴近「每写 2 fsync」的理论上限约 1,000 ops/s（拆解见 9.9），说明结构层几乎零开销。
+- 读路径本组件快 1.45 倍：两边都不涉及 fsync，纯比读布局——开放寻址 1 次探测 + 定长定位读，对 HTreeMap 的桶 + 链 + mmap 页解析更快。
+- 批量导入差距更大：本组件 `putAll`（每批 1,000 条共用一次落盘）实测 10,882 ops/s，是 MapDB 事务模式逐写单提交的 **57 倍**。MapDB 侧无等价的「批量单事务」基准（可自建，但事务过大时 WAL 膨胀、崩溃回滚窗口也变大）。
+- 两侧的 `max` 都落在结构维护上：FileBackedMap 修改阶段 max 28.5 s 是一次自动垃圾整理重建（第四节）；MapDB 插入 max 412 ms 是事务收尾的 WAL 合并与桶分裂。
+- 若把 MapDB 切回 3.1 默认**非事务**模式（`-Dbench.mapdb.tx=false`），写吞吐升至 4,584 / 5,571 ops/s 反超本组件——但那是**放弃逐写持久化**的结果（写入只进 mmap 由 OS 择机刷盘，崩溃后不保证已应答的写不丢），与本组件「落盘才返回」的语义不可比，因此正文以同强度的事务模式为准。
 - 语义差异：MapDB 提供事务、多 Map、并发容器等完整嵌入式 DB 能力；本组件刻意只做「单文件对 + Map 接口 + 崩溃恢复」这一件事。MapDB 以 `scope=test` 引入作为对照组依赖，不进入发布 jar。
 
 ## 十、已知取舍
