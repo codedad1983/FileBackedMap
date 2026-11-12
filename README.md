@@ -188,6 +188,8 @@ fsync 分两类，语义不同：
 ```
 filebackedmap/
 ├── pom.xml
+├── docs/
+│   └── perf-plan.md                   ← 插入性能优化方案（方案文档，未实施）
 ├── src/
 │   ├── main/java/com/codedad/fbmap/
 │   │   └── FileBackedMap.java          ← 组件主体（唯一的生产代码）
@@ -199,7 +201,7 @@ filebackedmap/
 │       │   └── CrashSafetyTest.java
 │       ├── bench/                     ← 性能专项测试
 │       │   ├── Benchmark.java          ← 100 万条插入 / 修改 / 查找
-│       │   ├── MapDbBenchmark.java    ← MapDB 对照组（相同场景）
+│       │   ├── MapDbBenchmark.java    ← MapDB 对照组（相同场景，事务模式对齐持久化强度）
 │       │   ├── CompactBench.java      ← 垃圾整理耗时
 │       │   ├── GrowBench.java         ← 扩容专项
 │       │   ├── VerifyFinal.java      ← 校验保留文件
@@ -441,6 +443,18 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 - **修改**：必须走完探测链（读槽 → 比对 key → 读旧值 → 判是否相等 → 追加新记录 → 写槽 → 写头），且**无论如何都要追加**（不原地覆盖），写放大接近 1 倍；fsync 成本与插入相同，p50 1,024 µs 与插入基本持平。因为追加使垃圾持续增长，修改阶段末会命中一次 `rebuild`（28.5 s），把平均值拉高到 1,205 µs。
 - **查找**：纯读路径，无 fsync；p50 43.3 µs ≈ 1 次槽位读 + 1 次 key 比对 + 1 次值读（3 次定位 I/O）。这是「系统调用 + 页缓存往返」的固定成本，不是哈希结构问题 —— 开放寻址平均只需 1 次探测。
 
+**写路径开销的实测拆解**（同 I/O 模式、同盘、只变持久化强度）：
+
+| 模式 | 吞吐 | 平均延迟 |
+|---|---|---|
+| 纯 I/O，无 fsync | 29,370 ops/s | 34.0 µs |
+| 每写 1 个 fsync | 1,675 ops/s | 597 µs |
+| 每写 2 个 fsync（现状） | 857 ops/s | 1,167 µs |
+| 批量：N 次写后各 1 次 fsync | 18,512 ops/s | 54.0 µs |
+
+单个 fsync ≈ 563 µs，两个线性叠加；结构层全部工作只占 34 µs（2.9%）。也就是说插入性能 97% 花在两次落盘同步上，哈希结构与文件布局都不是瓶颈——批量落盘可拿到 **21.6 倍**。具体优化方案（`putAll` 批量化 / 单文件布局 / 组提交的取舍与验收清单）见 [`docs/perf-plan.md`](docs/perf-plan.md)（方案文档，尚未实施）。
+
+
 ### 9.10 复现命令
 
 ```bash
@@ -467,7 +481,9 @@ java -cp $CP com.codedad.fbmap.bench.GrowBench <copy-of>.fbmap
 # 整理耗时（可选，另建目录，不覆盖上面保留的文件；fsync 全开约 39 分钟，其中整理本身约 19.7 s）
 java -Xmx512m -Dbench.n=1000000 -cp $CP com.codedad.fbmap.bench.CompactBench build/compact-data
 
-# MapDB 对照（约 8 分钟；classpath 需带上 MapDB 及其传递依赖，用 Maven 最省事）
+# MapDB 对照（事务模式约 2 小时 45 分，持久化强度与本组件对齐；
+# 加 -Dbench.mapdb.tx=false 切到非事务模式约 8 分钟，仅作强度参考。
+# classpath 需带上 MapDB 及其传递依赖，用 Maven 最省事）
 mvn -q test-compile dependency:build-classpath -Dmdep.outputFile=target/cp.txt
 CP="target/classes;target/test-classes;$(cat target/cp.txt)"     # Windows 用 ; 分隔
 java -Xmx256m -cp "$CP" com.codedad.fbmap.bench.MapDbBenchmark mapdb build/bench-data
