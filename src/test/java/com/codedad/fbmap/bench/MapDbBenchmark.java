@@ -20,19 +20,25 @@ import java.util.Random;
  * 延迟分位数统计、堆监控与 FileBackedMap 版一致。注意：MapDB 的 mmap 数据页不进
  * Java 堆，其内存成本体现在进程物理内存上，对比时需同时看堆占用与 DB 文件大小。
  *
- * 对照组配置刻意贴近 FileBackedMap 的使用方式：单个 DB 文件、非事务（MapDB 3.1 默认）、
- * 数据全在磁盘上、不驻留内存 —— 即 MapDB 官方推荐的堆外大 Map 用法：
- *   DBMaker.fileDB(f).fileMmapEnableIfSupported().closeOnJvmShutdown()
+ * 对照组配置与 FileBackedMap 的持久化强度对齐（-Dbench.mapdb.tx=true，默认）：
+ *   DBMaker.fileDB(f).fileMmapEnableIfSupported().transactionEnable()
+ * 事务模式下每次 db.commit() 把 WAL 记录 fsync 到磁盘后才返回——与本组件
+ * 「每次写操作 data.force → index.force 落盘才返回」是同一强度。
+ * -Dbench.mapdb.tx=false 回退到 MapDB 3.1 默认的非事务模式（不逐次 fsync，
+ * 由 OS 刷 mmap 页），仅作强度参考，不适合与本组件的 fsync 档位直接对比。
  *
  * 运行：
  *   java -Xmx256m -cp target/classes;target/test-classes;...deps... \
  *        com.codedad.fbmap.bench.MapDbBenchmark mapdb build/bench-data
- *   （-Xmx256m 与 FileBackedMap 基准一致，同时用于证明其不需要大堆；
- *     对照组若需大堆可自行放大）
+ *   （-Dbench.mapdb.tx=false 切换非事务模式；-Xmx256m 与 FileBackedMap 基准一致，
+ *     同时用于证明其不需要大堆；对照组若需大堆可自行放大）
  */
 public final class MapDbBenchmark {
 
     private static final int N = Integer.getInteger("bench.n", 1_000_000);
+
+    /** 事务模式（WAL + 逐 commit fsync），与 FileBackedMap 的逐写持久化强度对齐。 */
+    private static final boolean TX = Boolean.parseBoolean(System.getProperty("bench.mapdb.tx", "true"));
 
     private static final long SEED_INSERT = 0xA1B2C3D4E5F60718L;
     private static final long SEED_UPDATE = 0x1122334455667788L;
@@ -110,15 +116,18 @@ public final class MapDbBenchmark {
 
         System.out.println("=== MapDB 性能测试（对照组，与 FileBackedMap 相同场景） ===");
         System.out.println("N=" + N + "，键/值长度 [" + SampleGen.MIN_LEN + "," + SampleGen.MAX_LEN + "] 字符");
+        System.out.println("持久化模式 = " + (TX
+                ? "事务（每次 put 后 db.commit() → WAL fsync，与 FileBackedMap 逐写落盘同强度）"
+                : "非事务（MapDB 3.1 默认，不逐次 fsync，由 OS 刷 mmap 页）"));
         System.out.println("JVM 堆上限 = " + maxHeap / 1048576 + " MB，起始堆占用 = " + heapStart / 1048576 + " MB");
         System.out.println();
 
-        try (DB db = DBMaker.fileDB(file.toFile())
-                // MapDB 3.1 默认即非事务（3.0 的 transactionDisable 已移除），
-                // 与 FileBackedMap 的逐写语义对齐
-                .fileMmapEnableIfSupported()     // 堆外访问（官方推荐的大 Map 用法）
-                .closeOnJvmShutdown()
-                .make()) {
+        DBMaker.Maker maker = DBMaker.fileDB(file.toFile())
+                .fileMmapEnableIfSupported();     // 堆外访问（官方推荐的大 Map 用法）
+        if (TX) {
+            maker = maker.transactionEnable();    // WAL + commit 时 fsync
+        }
+        try (DB db = maker.closeOnJvmShutdown().make()) {
 
             HTreeMap<String, String> map = db.hashMap("m", Serializer.STRING, Serializer.STRING)
                     .createOrOpen();
@@ -131,6 +140,9 @@ public final class MapDbBenchmark {
                 String v = SampleGen.valueFor(SEED_INSERT, i);
                 long s = System.nanoTime();
                 map.put(k, v);
+                if (TX) {
+                    db.commit();
+                }
                 lat[i] = System.nanoTime() - s;
                 if (i % 100_000 == 99_999) {
                     System.out.printf("  insert %7d / %d   %.2fs%n", i + 1, N,
@@ -138,7 +150,9 @@ public final class MapDbBenchmark {
                 }
             }
             double insertSec = (System.nanoTime() - t) / 1e9;
-            db.commit();
+            if (!TX) {
+                db.commit();
+            }
             dumpPhase("INSERT", N, insertSec, lat, heapStart, heapUsed(), monitor.peak());
 
             // ---------- 阶段 2：随机修改 ----------
@@ -152,6 +166,9 @@ public final class MapDbBenchmark {
                 String v = SampleGen.valueFor(SEED_UPDATE, i);
                 long s = System.nanoTime();
                 String old = map.put(k, v);
+                if (TX) {
+                    db.commit();
+                }
                 lat[i] = System.nanoTime() - s;
                 if (old != null) {
                     updated++;
@@ -162,7 +179,9 @@ public final class MapDbBenchmark {
                 }
             }
             double updateSec = (System.nanoTime() - t) / 1e9;
-            db.commit();
+            if (!TX) {
+                db.commit();
+            }
             dumpPhase("UPDATE", N, updateSec, lat, heapStart, heapUsed(), monitor.peak());
             System.out.println("  改值命中（键已存在）= " + updated + " / " + N);
             System.out.println();
