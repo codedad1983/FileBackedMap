@@ -256,6 +256,56 @@ final class FileBackedMapTest {
     }
 
     @Test
+    @DisplayName("putAll 批量化：与逐条 put 等价（跨多次扩容 / null 键值 / 空串 / 覆盖），重开完整")
+    void putAllBatchEquivalence() throws IOException {
+        Path p = fresh(dir, "putall.fbmap");
+        Map<String, String> ref = new java.util.LinkedHashMap<>();
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            // 5,000 条：从 8 槽起步，批次内跨越 2/3 负载阈值多次 → 覆盖「批次中途扩容」路径
+            Map<String, String> batch = new java.util.LinkedHashMap<>();
+            for (int i = 0; i < 5000; i++) {
+                String v = switch ((int) (i % 7)) {
+                    case 3 -> null;
+                    case 4 -> "";
+                    default -> "v" + i + "-" + "x".repeat(i % 50);
+                };
+                batch.put("k" + i, v);
+            }
+            batch.put(null, "null-key-value");          // null 键
+            batch.put("nk", null);                       // null 值
+            m.putAll(batch);
+            ref.putAll(batch);
+
+            assertEquals(ref.size(), m.size(), "putAll 后 size");
+            for (Map.Entry<String, String> e : ref.entrySet()) {
+                assertEquals(e.getValue(), m.get(e.getKey()), "putAll 取值 " + e.getKey());
+            }
+
+            // 覆盖已存在键 + 与现存值相同的 no-op 写
+            Map<String, String> over = new java.util.LinkedHashMap<>();
+            over.put("k0", "new0");
+            over.put("k4999", "new4999");
+            over.put("k1", ref.get("k1"));
+            m.putAll(over);
+            ref.putAll(over);
+            assertEquals("new0", m.get("k0"), "putAll 覆盖 k0");
+            assertEquals("new4999", m.get("k4999"), "putAll 覆盖 k4999");
+
+            // 空批次：无副作用
+            m.putAll(java.util.Map.of());
+            assertEquals(ref.size(), m.size(), "空 putAll 不改 size");
+        }
+
+        // 重开：批量写入必须全部已落盘（正常返回的批次落盘才返回）
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            assertEquals(ref.size(), m.size(), "putAll 重开 size");
+            for (Map.Entry<String, String> e : ref.entrySet()) {
+                assertEquals(e.getValue(), m.get(e.getKey()), "putAll 重开取值 " + e.getKey());
+            }
+        }
+    }
+
+    @Test
     @DisplayName("迭代器：遍历、remove、setValue、快速失败")
     void iteratorSemantics() throws IOException {
         try (FileBackedMap m = new FileBackedMap(fresh(dir, "iter.fbmap"))) {

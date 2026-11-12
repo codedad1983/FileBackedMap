@@ -19,6 +19,7 @@ import java.util.zip.CRC32;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -563,6 +564,120 @@ final class CrashSafetyTest {
             assertEquals(0L, Files.size(dir.resolve("r1.fbmap.data")),
                     "C11 转正后的数据文件为空");
             assertTrue(recoveredFromCrash(m), "C11 应记为一次崩溃恢复");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 用例 13：putAll 批次中途进程被强杀 → 重开对账自洽
+    // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("C13 putAll 批次中途进程被强杀：重开对账自洽，绝不返回无法验证的内容")
+    void casePutAllKilledMidBatch() throws Exception {
+        Path p = fresh(dir, "putallcrash.fbmap");
+
+        String javaBin = Path.of(System.getProperty("java.home"), "bin", "java")
+                .toAbsolutePath().toString();
+        String cp = System.getProperty("java.class.path");
+        ProcessBuilder pb = new ProcessBuilder(javaBin, "-cp", cp,
+                PutAllCrasher.class.getName(), p.toString(), "200000");
+        pb.redirectErrorStream(true);
+        Process kid = pb.start();
+
+        // 等子进程开始批量写入（不要求写完——多半写不完就被强杀）
+        String line = null;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(kid.getInputStream(),
+                        java.nio.charset.Charset.defaultCharset()))) {
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (System.currentTimeMillis() < deadline) {
+                line = r.readLine();
+                if (line == null) {
+                    break;
+                }
+                if (line.startsWith("BATCH")) {
+                    break;
+                }
+            }
+        }
+        assertNotNull(line, "C13 子进程应输出 BATCH（未读到说明启动失败）");
+        assertTrue(line.startsWith("BATCH"), "C13 子进程应开始批量写入，实际: " + line);
+
+        // 强杀：页缓存里未 force 的记录与槽位随进程消失
+        kid.destroyForcibly();
+        kid.waitFor();
+
+        // 重开：脏标记在，必须触发对账；结果必须自洽
+        try (FileBackedMap m = openWithRetry(p, 10)) {
+            assertTrue(recoveredFromCrash(m), "C13 强杀后重开应执行对账");
+            long dataLen = Files.size(dir.resolve("putallcrash.fbmap.data"));
+            assertEquals(dataLen, dataBytes(m), "C13 对账后游标 = 数据文件实际长度");
+
+            int size = m.size();
+            int counted = 0;
+            for (String k : m.keySet()) {
+                counted++;
+                // 每个能读到的键必须等于批量写入时该键的值（绝不得返回半条 / 错值）
+                String v = m.get(k);
+                assertEquals(expected(k), v, "C13 强杀后键 " + k + " 的取值");
+            }
+            assertEquals(size, counted, "C13 size 与遍历计数一致（槽位与头自洽）");
+
+            // 对账后继续写入不受影响
+            m.put("AFTER", "ok");
+            assertEquals("ok", m.get("AFTER"), "C13 对账后可写入");
+        }
+
+        // 正常关闭后重开不应再触发对账，且内容不变
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            assertFalse(recoveredFromCrash(m), "C13 正常关闭后重开不应再对账");
+            assertEquals("ok", m.get("AFTER"), "C13 二次重开新键仍在");
+        }
+    }
+
+    /** putAll 批量写入用的键值约定（与 PutAllCrasher 完全一致，测试侧独立复算）。 */
+    private static String expected(String key) {
+        if (!key.startsWith("pk")) {
+            return null;
+        }
+        int i = Integer.parseInt(key.substring(2));
+        return (i % 5 == 3) ? null : "pv" + i;
+    }
+
+    /** 重开重试：强杀进程后锁释放可能有微小延迟（Windows）。 */
+    private static FileBackedMap openWithRetry(Path p, int attempts) throws IOException {
+        IOException last = null;
+        for (int i = 0; i < attempts; i++) {
+            try {
+                return new FileBackedMap(p);
+            } catch (IOException e) {
+                last = e;
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        throw last;
+    }
+
+    /** 崩溃用例子进程：打开 map 后开始一次性 putAll 大批量，写完就挂住等被强杀。 */
+    public static final class PutAllCrasher {
+        public static void main(String[] args) throws Exception {
+            int n = Integer.parseInt(args[1]);
+            java.util.Map<String, String> batch = new java.util.LinkedHashMap<>();
+            for (int i = 0; i < n; i++) {
+                batch.put("pk" + i, (i % 5 == 3) ? null : "pv" + i);
+            }
+            try (FileBackedMap m = new FileBackedMap(Path.of(args[0]))) {
+                System.out.println("BATCH " + batch.size());
+                System.out.flush();
+                m.putAll(batch);
+                // 写完也不退出，等父进程强杀（模拟「批次已写完但 close 落盘前被杀」）
+                Thread.sleep(600_000);
+            }
         }
     }
 

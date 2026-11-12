@@ -201,6 +201,7 @@ filebackedmap/
 │       │   └── CrashSafetyTest.java
 │       ├── bench/                     ← 性能专项测试
 │       │   ├── Benchmark.java          ← 100 万条插入 / 修改 / 查找
+│       │   ├── PutAllBench.java       ← putAll 批量插入专项（对照逐条）
 │       │   ├── MapDbBenchmark.java    ← MapDB 对照组（相同场景，事务模式对齐持久化强度）
 │       │   ├── CompactBench.java      ← 垃圾整理耗时
 │       │   ├── GrowBench.java         ← 扩容专项
@@ -277,9 +278,9 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 
 ## 八、测试覆盖
 
-三套测试均为 **JUnit 5** 测试类（`mvn test` 自动执行，合计 29 个 `@Test`；单个用例内是成百上千条对照断言，任何一条不符即失败）。每个用例使用 JUnit `@TempDir` 独享临时目录，用例之间零共享状态。
+三套测试均为 **JUnit 5** 测试类（`mvn test` 自动执行，合计 31 个 `@Test`；单个用例内是成百上千条对照断言，任何一条不符即失败）。每个用例使用 JUnit `@TempDir` 独享临时目录，用例之间零共享状态。
 
-`FileBackedMapTest`（`com.codedad.fbmap.test`）的 9 个用例（约 5300+ 项断言，与 `HashMap` 逐条对照）：
+`FileBackedMapTest`（`com.codedad.fbmap.test`）的 10 个用例（约 5800+ 项断言，与 `HashMap` 逐条对照）：
 
 1. 基本增删改查、size、clear（clear 后索引回到 64 + 8×16 = 192 B，数据文件为空）
 2. null 键、null 值、空串、中文、emoji、控制字符，含 null 键/值的各类更新路径
@@ -287,11 +288,12 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 4. 关闭重开后数据完整（持久化，索引 + 数据两个文件都能正确校验）
 5. 5000 轮随机操作与 `HashMap` 逐条对照（返回值、size、内容、hashCode、keySet、values、entrySet 包含关系）
 6. Java 8 默认方法：`putIfAbsent/compute/computeIfAbsent/computeIfPresent/merge/replace/replaceAll/forEach/putAll/remove(k,v)`
-7. 迭代器：遍历计数、迭代 `remove()`、`entry.setValue()` 写回、快速失败
-8. 视图与 `equals/hashCode/toString`
-9. 压力混合（黑盒）：反复改值长度 5 轮造垃圾、驱动内部自动扩容/自动整理，再删 90%、插入 3000 条，内容仍与 HashMap 完全一致（不触碰任何非公开方法）
+7. `putAll` 批量化专项：5,000 条一批（从 8 槽起步、批次内跨越负载阈值多次，覆盖「批次中途扩容」）+ null 键 / null 值 / 空串 / 覆盖已存在键 / 同值 no-op / 空批次，逐键与 `HashMap` 对照，重开后全部键值完整
+8. 迭代器：遍历计数、迭代 `remove()`、`entry.setValue()` 写回、快速失败
+9. 视图与 `equals/hashCode/toString`
+10. 压力混合（黑盒）：反复改值长度 5 轮造垃圾、驱动内部自动扩容/自动整理，再删 90%、插入 3000 条，内容仍与 HashMap 完全一致（不触碰任何非公开方法）
 
-`CrashSafetyTest`（`com.codedad.fbmap.crash`）的 12 个用例直接改写文件字节 / 摆布文件，构造各种「只完成一个文件落盘」与「提交线各步中断」的状态：
+`CrashSafetyTest`（`com.codedad.fbmap.crash`）的 13 个用例直接改写文件字节 / 摆布文件 / 强杀子进程，构造各种「只完成一个文件落盘」与「提交线各步中断」的状态：
 
 | 用例 | 构造的异常状态 | 期望行为 |
 |---|---|---|
@@ -307,6 +309,7 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 | C10 D2 后崩溃 | 只剩 tmp 对（两原始都删） | **续做**两个改名，回到固定名 |
 | C11 R1 后崩溃 | 新索引已转正 + `data.tmp` 未改名 | **续做**数据改名 |
 | C12 原始已删 + tmp 损坏 | 只剩损坏 tmp，或新索引缺配套数据 | 无法恢复，明确抛 `IOException` |
+| C13 putAll 中途强杀 | 子进程 `putAll` 20 万条批量写入途中被强杀 | 重开触发对账：`size` 与遍历计数一致、游标 = 数据文件实际长度、每个可读键取值精确（绝无半条/错值）、对账后可继续写入 |
 
 `ConcurrencyTest`（`com.codedad.fbmap.test`）的 8 个用例覆盖并发模型与独占锁（全部黑盒，跨进程用例用进程外 `java` 子进程真实持锁）：
 
