@@ -22,8 +22,8 @@ jobs:
           cache: maven
 
       # surefire 自动执行 JUnit 5 测试：
-      #   FileBackedMapTest  9 个用例（与 HashMap 逐条对照）
-      #   CrashSafetyTest    8 个用例（模拟半落盘 / 崩溃状态）
+      #   FileBackedMapTest   11 个用例（与 HashMap 逐条对照）
+      #   ConcurrencyTest      8 个用例（读写锁 / 跨进程独占锁 / close 删文件）
       - name: Build + test
         run: mvn -B -ntp verify
 

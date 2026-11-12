@@ -6,7 +6,7 @@
 
 - 仓库：<https://github.com/codedad1983/FileBackedMap>
 - 发布页：<https://github.com/codedad1983/FileBackedMap/releases>（推送 `v*` 标签自动构建发布 `filebackedmap-<版本>.jar` 与 `-sources.jar`）
-- 坐标：`com.codedad:filebackedmap:0.0.1`（Java 17+；生产代码零第三方依赖，测试仅需 JUnit 5）
+- 坐标：`com.codedad:filebackedmap:0.1.0`（Java 17+；生产代码零第三方依赖，测试仅需 JUnit 5）
 
 ## 一、定位与会话生命周期
 
@@ -145,7 +145,7 @@ javac -encoding UTF-8 -d build/classes $(find src/main/java -name '*.java')
 
 ```bash
 mvn test                             # 跑 JUnit 5 测试（正确性 11 例 + 并发 8 例）
-mvn package                          # 测试通过后产出 target/filebackedmap-0.0.1.jar 与 -sources.jar
+mvn package                          # 测试通过后产出 target/filebackedmap-0.1.0.jar 与 -sources.jar
 
 # 性能 / 演示等专项程序仍是 main() 形式，不进 surefire，按需 exec:java 运行：
 mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.bench.Benchmark \
@@ -160,7 +160,7 @@ mvn -q exec:java -Dexec.mainClass=com.codedad.fbmap.bench.Benchmark \
 <dependency>
     <groupId>com.codedad</groupId>
     <artifactId>filebackedmap</artifactId>
-    <version>0.0.1</version>
+    <version>0.1.0</version>
 </dependency>
 ```
 

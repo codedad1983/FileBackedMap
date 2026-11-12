@@ -23,7 +23,7 @@ jobs:
           java-version: '17'
           cache: maven
 
-      # mvn verify 会先跑 surefire（JUnit 5：正确性 + 崩溃安全测试），再打 jar
+      # mvn verify 会先跑 surefire（JUnit 5：正确性 + 并发/锁专项），再打 jar
       - name: Build jar + sources jar (runs JUnit tests first)
         run: mvn -B -ntp verify
 
@@ -48,25 +48,25 @@ jobs:
           body: |
             ## FileBackedMap v${{ steps.ver.outputs.num }}
 
-            基于文件存储的 `Map<String, String>` 实现，**数据全部在磁盘上，不驻留内存，也不使用内存映射**。
+            **HashMap 的磁盘扩展**：`Map<String, String>` 实现，键值数据放磁盘文件、堆内只有内存索引，会话作用域（close 删文件、不做持久化）。
 
             ### 核心特性
-            - 双文件布局：索引文件 `<path>`（64 B 头 + slotCount×16 B 槽位区）+ 数据文件 `<path>.data`（只追加记录区）。
-            - 扩容只重建 32 MB 级索引，数据区一字节不动（100 万条目实测 0.238 s，134 MB/s）。
-            - 记录不可变：更新一律追加，杜绝撕裂记录。
-            - 固定六步提交线：重建严格按「写 data.tmp → 写 index.tmp → 删原索引 → 删原数据 → 改名索引 → 改名数据」执行；打开时两条恢复规则（双原始齐→回滚删 tmp；原始不全且 tmp 对有效→续做改名）唯一判定任意崩溃快照。
-            - 打开时对账：脏标记 + 头 CRC32，悬空/撕裂槽位转墓碑丢弃，绝不返回错值。
+            - 会话生命周期：打开对目标文件取独占锁（被占抛 `IOException`）并清空同名旧文件；close() 释放锁并删除数据文件（幂等）。数据只在会话内有效，重启后由应用重新加载。
+            - 索引驻内存：开放定址三数组（状态/hash/偏移，13 B/槽），槽数 2 的幂、负载 2/3 翻倍；扩容 = 纯内存 rehash，零 I/O。
+            - 数据文件 = 构造路径本身：无头、无校验字段，只追加 `[len][UTF-8]` 记录；写完即可读回（页缓存），**全程无 fsync**。
+            - 无崩溃恢复 / 无垃圾整理 / 无 compact——定位就是「磁盘内存」，不是嵌入式数据库。
             - 键值长度无上限（单条记录约 2 GB 上限，总量受磁盘限制），支持 null 键 / null 值 / 空串 / 任意 Unicode。
-            - 公开 API 面只有 `java.util.Map` 接口方法 + `close()`，运维信息全部内部化。
+            - 公开 API 面只有 `java.util.Map` 接口方法 + `close()`。
 
-            ### 性能（100 万条，键值 100–1000 字符随机）
+            ### 性能（100 万条，键值 100–1000 字符随机，Windows + NVMe，-Xmx256m）
             | 阶段 | 吞吐 | p50 延迟 |
             |---|---|---|
-            | 插入 | 23,317 ops/s | 25.70 µs |
-            | 修改 | 10,836 ops/s | 49.60 µs |
-            | 查找 | 20,652 ops/s | 37.50 µs |
+            | 插入 | 48,933 ops/s | 6.5 µs |
+            | 修改 | 18,531 ops/s | 32.8 µs |
+            | 查找 | 27,084 ops/s | 36.9 µs |
+            | putAll 批量 | 46,097 ops/s | 15.9 µs |
 
-            磁盘：索引 32 MB + 数据 1,056 MB = 1,088 MB；内存堆增量 0 MB。
+            磁盘 ≈ 1,056 MB（净载荷）；堆占用 29 MB（同规模 HashMap 为 1,183 MB，仅其 2.5%）。
 
             ### 构建与引用
             ```bash
@@ -77,7 +77,7 @@ jobs:
             Maven 坐标：`com.codedad:filebackedmap:${{ steps.ver.outputs.num }}`（Java 17+，生产零依赖）。
 
             ### 测试
-            - `com.codedad.fbmap.test.FileBackedMapTest` —— JUnit 5 黑盒正确性测试（9 用例），与 `HashMap` 逐条对照
-            - `com.codedad.fbmap.crash.CrashSafetyTest` —— JUnit 5 崩溃安全专项（12 用例），模拟半落盘 / 提交线各步中断状态
+            - `com.codedad.fbmap.test.FileBackedMapTest` —— JUnit 5 黑盒正确性测试（11 用例），与 `HashMap` 逐条对照
+            - `com.codedad.fbmap.test.ConcurrencyTest` —— 并发与独占锁专项（8 用例）：读写锁、跨进程独占、回调重入、close 删文件
 
             详见 README。
