@@ -6,10 +6,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 /**
- * 简单演示：如何把 FileBackedMap 当作普通 Map 使用，同时数据始终在磁盘上。
+ * 简单演示：如何把 FileBackedMap 当作普通 Map 使用，键值数据始终写在磁盘文件里，
+ * 堆内存只承担一个可控大小的内存索引。
+ *
  * 纯黑盒：只用 Map 接口 + close()，不反射、不触碰任何非公开方法；
- * 文件大小只用普通文件系统 API 观察（索引路径是构造时传入的，
- * 数据文件按固定命名 <索引名>.data 直接访问）。
+ * 文件大小只用普通文件系统 API 观察（数据文件就是构造时传入的路径）。
+ *
+ * 会话语义：打开即清空同名旧文件，close() 删除文件——演示会展示这两点。
  */
 public final class Demo {
 
@@ -17,7 +20,7 @@ public final class Demo {
         Path dir = Path.of(args.length > 0 ? args[0] : "build/demo-data");
         Files.createDirectories(dir);
         Path file = dir.resolve("demo.fbmap");
-        cleanPrevious(file);
+        Files.deleteIfExists(file);
 
         try (FileBackedMap map = new FileBackedMap(file)) {
             map.put("name", "张三");
@@ -40,14 +43,13 @@ public final class Demo {
 
             map.remove("city");
             System.out.println("\nremove(city) 后 size = " + map.size());
-            System.out.println("索引文件 = " + Files.size(file) + " 字节"
-                    + "，数据文件 = " + dataSize(file) + " 字节");
+            System.out.println("数据文件 = " + Files.size(file) + " 字节");
         }
 
-        // 重新打开，数据依然在
+        // close() 已删除数据文件；重开是全新空会话（组件不做持久化）
+        System.out.println("\nclose 后文件存在 = " + Files.exists(file));
         try (FileBackedMap map = new FileBackedMap(file)) {
-            System.out.println("\n重新打开后 size = " + map.size()
-                    + "，get(name) = " + map.get("name"));
+            System.out.println("重新打开后 size = " + map.size() + "（会话作用域：旧数据不保留）");
         }
 
         demoHeapIndependence(dir);
@@ -56,7 +58,7 @@ public final class Demo {
     /** 证明键值数据没有驻留堆内存：写入约 20 MB 数据，堆占用几乎不增长。 */
     private static void demoHeapIndependence(Path dir) throws Exception {
         Path file = dir.resolve("heap.fbmap");
-        cleanPrevious(file);
+        Files.deleteIfExists(file);
 
         Runtime rt = Runtime.getRuntime();
         long before = used(rt);
@@ -69,31 +71,14 @@ public final class Demo {
             }
             long during = used(rt);
             System.out.println("\n写入 " + count + " 条 × 1KB（约 20 MB 数据）");
-            System.out.println("  索引文件   = " + Files.size(file) / 1024 / 1024 + " MB，数据文件 = "
-                    + dataSize(file) / 1024 / 1024 + " MB");
-            System.out.println("  堆占用增量 = " + (during - before) / 1024 + " KB  (仅临时编码缓冲区)");
+            System.out.println("  数据文件   = " + Files.size(file) / 1024 / 1024 + " MB");
+            System.out.println("  堆占用增量 = " + (during - before) / 1024 + " KB  (仅索引数组与临时编码缓冲区)");
             System.out.println("  map.size() = " + map.size());
         }
-    }
-
-    /** 数据文件字节数：固定命名 <索引名>.data，直接按名取，无需组件内部信息。 */
-    private static long dataSize(Path indexFile) throws Exception {
-        Path data = indexFile.resolveSibling(indexFile.getFileName() + ".data");
-        return Files.exists(data) ? Files.size(data) : 0L;
     }
 
     private static long used(Runtime rt) {
         System.gc();
         return rt.totalMemory() - rt.freeMemory();
-    }
-
-    /** 删除索引、数据文件与临时文件，避免跨次运行互相干扰。 */
-    private static void cleanPrevious(Path indexFile) throws Exception {
-        Path dir = indexFile.getParent();
-        String base = indexFile.getFileName().toString();
-        Files.deleteIfExists(indexFile);
-        Files.deleteIfExists(dir.resolve(base + ".data"));
-        Files.deleteIfExists(dir.resolve(base + ".index.tmp"));
-        Files.deleteIfExists(dir.resolve(base + ".data.tmp"));
     }
 }

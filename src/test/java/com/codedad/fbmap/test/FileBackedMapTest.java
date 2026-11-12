@@ -27,8 +27,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * FileBackedMap 的行为验证（JUnit 5，与 java.util.HashMap 逐条对照）。
  *
  * 本类代表「正常使用」：只用 java.util.Map 接口 + close()，不反射、不触碰任何
- * 非公开方法。对文件的观察只用普通文件系统 API（索引路径是构造时自己传入的；
- * 数据文件按固定命名 <索引名>.data 直接访问）。
+ * 非公开方法。对文件的观察只用普通文件系统 API（数据文件就是构造时传入的路径）。
+ *
+ * 会话语义：打开时清空同名旧文件（旧数据作废），close() 删除数据文件——
+ * 「持久化重开」用例因此变成「会话作用域」用例：重开永远是空表。
  *
  * 运行：mvn test（surefire 自动执行），或 IDE 里直接跑本类。
  * 每个用例独享一个 JUnit @TempDir，用例之间零共享状态。
@@ -45,16 +47,7 @@ final class FileBackedMapTest {
     private static Path fresh(Path dir, String name) throws IOException {
         Path p = dir.resolve(name);
         Files.deleteIfExists(p);
-        Files.deleteIfExists(dir.resolve(name + ".data"));
-        Files.deleteIfExists(dir.resolve(name + ".index.tmp"));
-        Files.deleteIfExists(dir.resolve(name + ".data.tmp"));
         return p;
-    }
-
-    /** 数据文件字节数：数据文件固定命名 <索引名>.data，直接按名取，无需组件内部信息。 */
-    private static long dataSize(Path dir, String indexName) throws IOException {
-        Path data = dir.resolve(indexName + ".data");
-        return Files.exists(data) ? Files.size(data) : 0L;
     }
 
     // ------------------------------------------------------------------
@@ -85,12 +78,11 @@ final class FileBackedMapTest {
                 m.put("k" + i, "v" + i);
             }
             assertEquals(100, m.size(), "批量 put 后 size");
+            assertTrue(Files.size(p) > 0, "写入期间数据文件应有字节");
             m.clear();
             assertEquals(0, m.size(), "clear 后 size");
             assertTrue(m.isEmpty(), "clear 后 isEmpty");
-            long expectedIndex = 64 + 8L * 16;   // 头 + 最小槽位区
-            assertEquals(expectedIndex, Files.size(p), "clear 后索引文件被截断到最小布局");
-            assertEquals(0L, dataSize(dir, "basic.fbmap"), "clear 后数据文件为空");
+            assertEquals(0L, Files.size(p), "clear 把数据文件截断为 0");
         }
     }
 
@@ -154,28 +146,40 @@ final class FileBackedMapTest {
     }
 
     @Test
-    @DisplayName("关闭后重新打开，数据仍在（持久化）")
-    void persistence() throws IOException {
-        Path p = fresh(dir, "persist.fbmap");
-        Map<String, String> expected = new HashMap<>();
+    @DisplayName("会话作用域：重开即清空，close 删除数据文件")
+    void sessionScope() throws IOException {
+        Path p = fresh(dir, "session.fbmap");
         try (FileBackedMap m = new FileBackedMap(p)) {
             for (int i = 0; i < 500; i++) {
-                String k = "key-" + i;
-                String v = "value-" + i + "-" + "x".repeat(i % 37);
-                m.put(k, v);
-                expected.put(k, v);
+                m.put("key-" + i, "value-" + i + "-" + "x".repeat(i % 37));
             }
-            m.remove("key-0");
-            expected.remove("key-0");
-            m.put("key-1", "updated");
-            expected.put("key-1", "updated");
+            assertTrue(Files.exists(p), "会话期间数据文件存在");
+            assertTrue(Files.size(p) > 0, "会话期间数据文件有内容");
         }
+        // close() 删除数据文件
+        assertFalse(Files.exists(p), "close 后数据文件必须已被删除");
+
+        // 重开：同名旧文件被清空，会话永远从空表开始
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertEquals(expected.size(), m.size(), "重开后 size");
-            for (Map.Entry<String, String> e : expected.entrySet()) {
-                assertEquals(e.getValue(), m.get(e.getKey()), "重开后取值 " + e.getKey());
-            }
-            assertEquals(expected, new HashMap<>(m), "重开后整体内容相等");
+            assertTrue(m.isEmpty(), "重开必须是空表（旧数据不作持久化）");
+            assertEquals(0, m.size(), "重开 size = 0");
+            assertNull(m.get("key-0"), "旧键在重开后不存在");
+            m.put("fresh", "only");
+            assertEquals(1, m.size(), "重开会话独立写入");
+        }
+    }
+
+    @Test
+    @DisplayName("打开同名旧文件：立即清空旧内容（等同删除重建）")
+    void openTruncatesOldFile() throws IOException {
+        Path p = fresh(dir, "truncate.fbmap");
+        // 用普通文件 API 放一份"上一代"的旧内容
+        Files.writeString(p, "leftover bytes from an old generation");
+        try (FileBackedMap m = new FileBackedMap(p)) {
+            assertTrue(m.isEmpty(), "打开即清空：旧内容作废");
+            assertEquals(0L, Files.size(p), "打开后数据文件长度归零");
+            m.put("a", "1");
+            assertEquals("1", m.get("a"), "清空后正常读写");
         }
     }
 
@@ -256,7 +260,7 @@ final class FileBackedMapTest {
     }
 
     @Test
-    @DisplayName("putAll 批量化：与逐条 put 等价（跨多次扩容 / null 键值 / 空串 / 覆盖），重开完整")
+    @DisplayName("putAll 批量：与逐条 put 等价（跨多次扩容 / null 键值 / 空串 / 覆盖）")
     void putAllBatchEquivalence() throws IOException {
         Path p = fresh(dir, "putall.fbmap");
         Map<String, String> ref = new java.util.LinkedHashMap<>();
@@ -294,14 +298,6 @@ final class FileBackedMapTest {
             // 空批次：无副作用
             m.putAll(java.util.Map.of());
             assertEquals(ref.size(), m.size(), "空 putAll 不改 size");
-        }
-
-        // 重开：批量写入必须全部已落盘（正常返回的批次落盘才返回）
-        try (FileBackedMap m = new FileBackedMap(p)) {
-            assertEquals(ref.size(), m.size(), "putAll 重开 size");
-            for (Map.Entry<String, String> e : ref.entrySet()) {
-                assertEquals(e.getValue(), m.get(e.getKey()), "putAll 重开取值 " + e.getKey());
-            }
         }
     }
 
@@ -379,11 +375,11 @@ final class FileBackedMapTest {
     }
 
     @Test
-    @DisplayName("大量更新 / 删除 / 再插入混合后内容仍一致（覆盖自动扩容与自动整理路径，黑盒）")
+    @DisplayName("大量更新 / 删除 / 再插入混合后内容仍一致（覆盖自动扩容路径，黑盒）")
     void churnAndStress() throws IOException {
         Path p = fresh(dir, "stress.fbmap");
         HashMap<String, String> ref = new HashMap<>();
-        try (FileBackedMap m = new FileBackedMap(p)) {   // 顺便验证逐次 fsync 落盘路径
+        try (FileBackedMap m = new FileBackedMap(p)) {
             for (int i = 0; i < 2000; i++) {
                 String k = "k" + i;
                 String v = "x".repeat(64);
@@ -391,7 +387,7 @@ final class FileBackedMapTest {
                 ref.put(k, v);
             }
 
-            // 反复改值长度 -> 垃圾持续增长，跨过阈值时组件内部自动整理/扩容（黑盒，不可见也不干预）
+            // 反复改值长度 -> 数据文件只增不减（无整理功能），内容必须始终一致
             for (int r = 0; r < 5; r++) {
                 for (int i = 0; i < 2000; i++) {
                     String k = "k" + i;
@@ -400,7 +396,7 @@ final class FileBackedMapTest {
                     ref.put(k, v);
                 }
             }
-            assertTrue(dataSize(dir, "stress.fbmap") > 0, "数据确实写在磁盘上");
+            assertTrue(Files.size(p) > 0, "数据确实写在磁盘上");
 
             // 删除 90% 后逐个核对
             for (int i = 0; i < 2000; i++) {
@@ -422,12 +418,6 @@ final class FileBackedMapTest {
             }
             assertEquals(ref, new HashMap<>(m), "删除+插入混合后内容一致");
             assertEquals(ref.hashCode(), m.hashCode(), "混合后 hashCode 一致");
-        }
-
-        // 重新打开再核对一次（fsync 落盘应完整）
-        try (FileBackedMap m = new FileBackedMap(p)) {
-            assertEquals(ref, new HashMap<>(m), "重开后内容一致");
-            assertEquals(ref.size(), m.size(), "重开后 size");
         }
     }
 }

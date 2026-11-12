@@ -30,9 +30,7 @@ public final class PutAllBench {
         Path dir = Path.of(args.length > 0 ? args[0] : "build/putall-data");
         Files.createDirectories(dir);
         Path file = dir.resolve("putall.fbmap");
-        for (String suffix : new String[]{"", ".data", ".index.tmp", ".data.tmp"}) {
-            Files.deleteIfExists(Path.of(file + suffix));
-        }
+        Files.deleteIfExists(file);
 
         long[] lat = new long[N];
         System.out.println("=== putAll 批量插入专项（对照 Benchmark 逐条插入） ===");

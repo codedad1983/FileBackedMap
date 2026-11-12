@@ -106,9 +106,6 @@ public final class Benchmark {
     private static void runMap(Path dir) throws Exception {
         Path file = dir.resolve("fbmap-1M.fbmap");
         Files.deleteIfExists(file);
-        Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.data"));
-        Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.index.tmp"));
-        Files.deleteIfExists(dir.resolve("fbmap-1M.fbmap.data.tmp"));
 
         long[] lat = new long[N];          // 延迟统计数组（8 MB，不属于被测组件）
         long heapStart = heapUsed();       // 已包含统计数组，因此后续 delta 只反映组件
@@ -205,14 +202,11 @@ public final class Benchmark {
 
             long indexBytes = BenchInternals.indexBytes(map);
             long dataBytes = BenchInternals.dataBytes(map);
-            long total = indexBytes + dataBytes;
             System.out.println();
             System.out.println("FINAL size      = " + map.size());
-            System.out.println("FINAL index     = " + BenchInternals.indexFile(map));
             System.out.println("FINAL data      = " + BenchInternals.dataFile(map));
-            System.out.println("FINAL indexBytes = " + indexBytes + "  (" + indexBytes / 1048576 + " MB)");
-            System.out.println("FINAL dataBytes  = " + dataBytes + "  (" + dataBytes / 1048576 + " MB)");
-            System.out.println("FINAL totalBytes = " + total + "  (" + total / 1048576 + " MB)");
+            System.out.println("FINAL indexBytes(mem) = " + indexBytes + "  (" + indexBytes / 1048576 + " MB)");
+            System.out.println("FINAL dataBytes       = " + dataBytes + "  (" + dataBytes / 1048576 + " MB)");
             System.out.println("FINAL slots=" + BenchInternals.slots(map) + " entries=" + BenchInternals.entries(map)
                     + " tombstones=" + BenchInternals.tombstones(map) + " garbage=" + BenchInternals.garbageBytes(map) + " B");
             System.out.println("FINAL load      = " + String.format("%.3f", BenchInternals.loadFactor(map)));

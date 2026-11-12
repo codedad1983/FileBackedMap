@@ -8,12 +8,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -28,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -35,18 +32,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 并发与独占锁专项测试（黑盒，仅用 public API + 进程外 java 子进程）。
  *
  * <ul>
- *   <li>P1 跨进程独占：第二个 JVM 进程打开同一组文件必须失败；持有进程退出后可正常打开。</li>
+ *   <li>P1 跨进程独占：第二个 JVM 进程打开同一文件必须失败；持有进程被杀后锁随句柄释放。</li>
  *   <li>P2 同进程重复打开：必须失败（同一 FileChannel 重复加锁 → 统一转 IOException）。</li>
  *   <li>P3 多读一写并发：读走读锁可并发，写走写锁独占，最终状态一致、无异常。</li>
  *   <li>P4 并发读互不干扰：共享缓冲已线程私有，多线程同时读不同键结果全部正确。</li>
  *   <li>P5 回调重入不死锁：forEach / compute 的回调里再调用本实例方法（写锁可重入）。</li>
  *   <li>P6 迭代器并发扫描：两个线程同时遍历，各自得到完整一致的快照。</li>
- *   <li>P7 close() 无条件落盘：close 后磁盘上的脏标记必须已清零。</li>
+ *   <li>P7 close() 删除数据文件：close 后文件不存在，重开是全新空会话。</li>
  * </ul>
  */
 final class ConcurrencyTest {
-
-    private static final int H_FLAGS = 20;
 
     @TempDir
     Path dir;
@@ -54,22 +49,7 @@ final class ConcurrencyTest {
     private static Path fresh(Path dir, String name) throws IOException {
         Path p = dir.resolve(name);
         Files.deleteIfExists(p);
-        Files.deleteIfExists(dir.resolve(name + ".data"));
-        Files.deleteIfExists(dir.resolve(name + ".index.tmp"));
-        Files.deleteIfExists(dir.resolve(name + ".data.tmp"));
         return p;
-    }
-
-    private static int flagsOnDisk(Path indexFile) throws IOException {
-        try (FileChannel ch = FileChannel.open(indexFile, StandardOpenOption.READ)) {
-            ByteBuffer bb = ByteBuffer.allocate(64);
-            while (bb.hasRemaining()) {
-                if (ch.read(bb) < 0) {
-                    throw new IOException("索引文件不足 64 字节");
-                }
-            }
-            return bb.getInt(H_FLAGS);
-        }
     }
 
     // ------------------------------------------------------------------
@@ -77,12 +57,9 @@ final class ConcurrencyTest {
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("P1 第二个进程打开同一组文件必须失败；其退出后可正常打开")
+    @DisplayName("P1 第二个进程打开同一文件必须失败；其被杀后锁释放、可再次打开")
     void crossProcessExclusiveLock() throws Exception {
         Path p = fresh(dir, "xproc.fbmap");
-        try (FileBackedMap m = new FileBackedMap(p)) {
-            m.put("owner", "pid-A");
-        }
 
         String javaBin = Path.of(System.getProperty("java.home"), "bin", "java")
                 .toAbsolutePath().toString();
@@ -123,14 +100,16 @@ final class ConcurrencyTest {
         holder.destroy();
         assertTrue(holder.waitFor(15, java.util.concurrent.TimeUnit.SECONDS), "子进程应在销毁后退出");
 
-        // 进程退出 → 系统释放锁 → 可正常打开并读到原内容。
+        // 进程被杀 → 系统随句柄释放锁 → 可正常打开。
+        // 强杀不会走 close()，文件残留；但下次打开立刻清空，会话从空开始。
         // Windows 上句柄表拆除可能略晚于进程退出，给短暂重试窗口。
         FileBackedMap m = openWithRetry(p, 10);
         try {
-            assertEquals("pid-A", m.get("owner"), "锁释放后应能正常打开并读到原有内容");
+            assertTrue(m.isEmpty(), "崩溃残留文件在重开时被清空，会话从空开始");
         } finally {
             m.close();
         }
+        assertFalse(Files.exists(p), "close 后文件被删除");
     }
 
     /** 打开并重试：进程退出后锁释放可能有微小延迟。 */
@@ -168,7 +147,7 @@ final class ConcurrencyTest {
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("P2 同进程内第二个实例打开同一组文件必须失败（不抛底层异常）")
+    @DisplayName("P2 同进程内第二个实例打开同一文件必须失败（不抛底层异常）")
     void sameProcessSecondOpenFails() throws IOException {
         Path p = fresh(dir, "dupopen.fbmap");
         try (FileBackedMap m = new FileBackedMap(p)) {
@@ -183,9 +162,11 @@ final class ConcurrencyTest {
             // 失败的那次打开不得破坏第一个实例
             assertEquals("1", m.get("a"), "失败的打开不应影响第一个实例");
         }
-        // close 释放锁后可重开
+        // close 释放锁并删文件后可重开（全新空会话）
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertEquals("1", m.get("a"));
+            assertTrue(m.isEmpty(), "重开是全新空会话");
+            m.put("a", "2");
+            assertEquals("2", m.get("a"));
         }
     }
 
@@ -405,26 +386,30 @@ final class ConcurrencyTest {
     }
 
     // ------------------------------------------------------------------
-    // P7 close() 无条件落盘
+    // P7 close() 删除数据文件
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("P7 close 后，磁盘上的脏标记已清零（close 无条件 force）")
-    void closeFlushesDirtyFlag() throws IOException {
-        Path p = fresh(dir, "closedurable.fbmap");
+    @DisplayName("P7 close 删除数据文件；close 幂等；重开是全新空会话")
+    void closeDeletesFile() throws IOException {
+        Path p = fresh(dir, "closedel.fbmap");
         try (FileBackedMap m = new FileBackedMap(p)) {
             m.put("a", "1");
             m.put("b", "2");
-            // 会话进行中的脏标记由 CrashSafetyTest 的 dirty() 断言覆盖；
-            // 这里不能直接读索引文件——独占锁在 Windows 上会挡住外部读取。
+            assertTrue(Files.exists(p), "会话期间文件存在");
         }
-        assertEquals(0, flagsOnDisk(p) & 1, "close 后磁盘上的脏标记必须为 0");
+        assertFalse(Files.exists(p), "close 后数据文件必须已被删除");
 
-        // 重开不应触发对账，数据完好
+        // close 幂等：重复 close 不抛
+        FileBackedMap m2 = new FileBackedMap(p);
+        m2.put("x", "1");
+        m2.close();
+        assertDoesNotThrow(m2::close);
+
+        // 重开是全新空会话
         try (FileBackedMap m = new FileBackedMap(p)) {
-            assertEquals(2, m.size());
-            assertEquals("1", m.get("a"));
-            assertEquals("2", m.get("b"));
+            assertEquals(0, m.size(), "重开 size = 0");
+            assertNull(m.get("a"), "旧键不保留");
         }
     }
 
