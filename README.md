@@ -189,7 +189,7 @@ fsync 分两类，语义不同：
 filebackedmap/
 ├── pom.xml
 ├── docs/
-│   └── perf-plan.md                   ← 插入性能优化方案（方案文档，未实施）
+│   └── perf-plan.md                   ← 插入性能优化方案（A 已实施，B/C 留档）
 ├── src/
 │   ├── main/java/com/codedad/fbmap/
 │   │   └── FileBackedMap.java          ← 组件主体（唯一的生产代码）
@@ -380,6 +380,15 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 
 > 修改阶段末尾那次 **28.5 s** 的 `max` 是自动垃圾整理（`rebuild`）：100 万次更新全部是「追加新记录」，垃圾字节恰好越过「数据区一半 / 4096」门槛，于是整条数据区被重写一遍。这是策略的必然结果 —— 更安全（记录不可变）的代价是更高的写放大。
 
+**批量插入（`putAll`，每 1,000 条共用一次落盘）**
+
+| 阶段 | 次数 | 总耗时 | **吞吐（次/秒）** | 平均延迟 | p50 | p95 | p99 |
+|---|---|---|---|---|---|---|---|
+| 逐条 `put` | 1,000,000 | 1,105.2 s | 905 ops/s | 1,105 µs | 1,003 µs | 1,328 µs | 1,529 µs |
+| **`putAll` 批量** | 1,000,000 | 91.9 s | **10,882 ops/s** | 91.9 µs | 79.0 µs | 95.4 µs | 132.9 µs |
+
+`putAll` 把逐写路径「每条 2 个 fsync」摊薄成「每批 2 个 fsync」，插入吞吐提升约 **12 倍**（本轮 1M 与 MapDB 1M 基准同盘并发，存在 I/O 争抢，为保守值；单独跑 5 万条时达 14,762 ops/s，p50 46 µs）。落盘顺序与逐写完全一致，崩溃安全不变——批次中途进程被强杀时页缓存里未落盘的槽位丢失，下次打开走既有对账，表现为「批次部分生效」，与 `Map.putAll` 契约一致（用例 C13）。**批量导入请用 `putAll`，单键写仍走 `put` 的逐写落盘语义。**
+
 ### 9.5 与 HashMap 对照（同样 100 万条、同样样本）
 
 | 阶段 | FileBackedMap | HashMap | 倍数（HashMap / 本组件） |
@@ -455,7 +464,7 @@ try (FileBackedMap map = new FileBackedMap(Path.of("data", "kv.fbmap"))) {
 | 每写 2 个 fsync（现状） | 857 ops/s | 1,167 µs |
 | 批量：N 次写后各 1 次 fsync | 18,512 ops/s | 54.0 µs |
 
-单个 fsync ≈ 563 µs，两个线性叠加；结构层全部工作只占 34 µs（2.9%）。也就是说插入性能 97% 花在两次落盘同步上，哈希结构与文件布局都不是瓶颈——批量落盘可拿到 **21.6 倍**。具体优化方案（`putAll` 批量化 / 单文件布局 / 组提交的取舍与验收清单）见 [`docs/perf-plan.md`](docs/perf-plan.md)（方案文档，尚未实施）。
+单个 fsync ≈ 563 µs，两个线性叠加；结构层全部工作只占 34 µs（2.9%）。也就是说插入性能 97% 花在两次落盘同步上，哈希结构与文件布局都不是瓶颈——批量落盘可拿到 **21.6 倍**。这条结论已落地为 `putAll` 批量化（见 9.4 批量档）；其余候选（单文件布局、组提交）的取舍见 [`docs/perf-plan.md`](docs/perf-plan.md)。
 
 
 ### 9.10 复现命令
@@ -471,6 +480,9 @@ CP=build/classes
 
 # 本组件 100 万条（fsync 全开，约 39 分钟）
 java -Xmx256m -cp $CP com.codedad.fbmap.bench.Benchmark map build/bench-data
+
+# putAll 批量插入专项（每批 1,000 条，约 2 分钟；-Dbench.batch 调批大小）
+java -Xmx256m -cp $CP com.codedad.fbmap.bench.PutAllBench build/putall-data
 
 # HashMap 对照（约 34 秒）
 java -Xmx8g -cp $CP com.codedad.fbmap.bench.Benchmark baseline build/bench-data
@@ -512,7 +524,7 @@ MapDB 3.1.0（`HTreeMap`，单文件 + mmap，官方推荐的堆外大 Map 用�
 
 ## 十、已知取舍
 
-- **每次操作都是文件 I/O，写路径还包含 2 个 fsync**：`get` 一次约 2–3 次定位读取，比 HashMap 慢 8 倍（p50 约 43 µs vs 微秒级）；写操作比 HashMap 慢 85–90 倍，因为每次写都要等 data 与 index 两个 fsync 落盘（约 1 ms）。这是「数据不驻内存 + 逐写持久化」的必然代价。
+- **单键写受 2 个 fsync 限制，批量写请用 `putAll`**：`get` 一次约 2–3 次定位读取，比 HashMap 慢 8 倍（p50 约 43 µs vs 微秒级）；单键 `put` 比 HashMap 慢 85–90 倍，因为每次写都要等 data 与 index 两个 fsync 落盘（约 1 ms）。这是「数据不驻内存 + 逐写持久化」的必然代价。批量导入走 `putAll`（每批共用一次落盘）可把插入吞吐提升约 12 倍（见 9.4 批量档），落盘顺序与崩溃安全不变。
 - **更新一律追加 → 写放大 1 倍**：这是为了换取崩溃安全（记录不可变、无撕裂记录）。代价是高频更新会持续产生垃圾，垃圾超过数据区一半时自动触发整条数据区重写（1 GB 实测 19.7 s）。整理是组件内部职责（`private`），无需也不允许外部干预。
 - **扩容便宜、整理昂贵**：扩容只重写 32 MB 级索引（实测 0.478 s）；整理必须重写数据区。成本差别来自「写字节数」而非「系统调用」。
 - **无缓存**：如需高性能，可在应用层加只读缓存副本（那就等于把数据放回内存，与需求冲突）。
