@@ -131,8 +131,14 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     private final ReentrantReadWriteLock.WriteLock writeLock = lock.writeLock();
 
     // 复用缓冲：读锁下多个读者并发访问，必须线程私有（ThreadLocal），不能用共享实例字段。
+    // 缓冲内字节仅供当场比较/解码使用，不留引用；需要存活的 String 一律先拷贝。
     private final ThreadLocal<byte[]> intBytes = ThreadLocal.withInitial(() -> new byte[4]);
-    private final ThreadLocal<byte[]> compareBuffer = ThreadLocal.withInitial(() -> new byte[1024]);
+    // 整块读缓冲：短记录（键字节 + 值字段 ≤ BLOCK_SIZE）一次读完整取出，
+    // 读/更新/删除热路径的 I/O 次数从 3 次降到 1 次。
+    private final ThreadLocal<byte[]> valueBuffer = ThreadLocal.withInitial(() -> new byte[1024]);
+    // 追加记录组装复用缓冲（仅写锁内使用，容量随最大记录增长）
+    private final ThreadLocal<ByteBuffer> recordBuffer =
+            ThreadLocal.withInitial(() -> ByteBuffer.allocate(2048));
 
     // ==================================================================
     // 构造 / 打开
@@ -256,71 +262,80 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
     }
 
     private boolean keyEquals(long offset, byte[] keyBytes) throws IOException {
-        int keyLen = readInt(offset);
         if (keyBytes == null) {
-            return keyLen == -1;
+            return readInt(offset) == -1;
         }
-        if (keyLen != keyBytes.length) {
+        // 一次块读覆盖 [键长字段][键字节]，比 readInt + readAt 两段读少一次 I/O
+        byte[] cb = valueBuffer.get();
+        int want = keyBytes.length + 4;
+        if (cb.length < want) {
+            cb = new byte[want];
+            valueBuffer.set(cb);
+        }
+        int avail = (int) Math.min(cb.length, dataEnd - offset);
+        readAt(offset, cb, 0, avail);
+        if (intFrom(cb, 0) != keyBytes.length) {
             return false;
         }
-        byte[] cb = compareBuffer.get();
-        if (cb.length < keyLen) {
-            cb = new byte[keyLen];
-            compareBuffer.set(cb);
-        }
-        readAt(offset + 4, cb, 0, keyLen);
-        for (int i = 0; i < keyLen; i++) {
-            if (cb[i] != keyBytes[i]) {
-                return false;
-            }
-        }
-        return true;
+        return Arrays.mismatch(cb, 4, 4 + keyBytes.length, keyBytes, 0, keyBytes.length) < 0;
     }
 
-    private long valueLenPos(long offset) throws IOException {
-        int keyLen = readInt(offset);
-        return offset + 4 + Math.max(keyLen, 0);
+    private static int intFrom(byte[] b, int i) {
+        return ((b[i] & 0xFF) << 24)
+                | ((b[i + 1] & 0xFF) << 16)
+                | ((b[i + 2] & 0xFF) << 8)
+                | (b[i + 3] & 0xFF);
+    }
+
+    /**
+     * 块读整条记录到 valueBuffer（缓冲起点即 offset）：短记录一次 I/O 到位；
+     * 缓冲不足时按需扩容并重读（罕见，扩容后长期受益）。
+     * 返回 valLen（-1 = null 值）；值字节位于 valueBuffer[8 + kl, 8 + kl + valLen)，
+     * 其中 kl = Math.max(键长, 0)，调用方可从 b[0..3] 免费取到键长。
+     */
+    private int readValueInto(long offset) throws IOException {
+        byte[] b = valueBuffer.get();
+        int avail = (int) Math.min(b.length, dataEnd - offset);
+        readAt(offset, b, 0, avail);
+        int kl = Math.max(intFrom(b, 0), 0);
+        if (kl + 8 > avail) {
+            // 缓冲读不全 [键长][键][值长字段]：扩到恰好容下，重读一次
+            b = new byte[kl + 8];
+            valueBuffer.set(b);
+            readAt(offset, b, 0, kl + 8);
+            avail = kl + 8;
+        }
+        int valLen = intFrom(b, 4 + kl);
+        if (valLen >= 0 && 8 + kl + valLen > avail) {
+            b = new byte[8 + kl + valLen];
+            valueBuffer.set(b);
+            readAt(offset, b, 0, 8 + kl + valLen);
+        }
+        return valLen;
     }
 
     private String readValueAt(long offset) throws IOException {
-        long vp = valueLenPos(offset);
-        int valLen = readInt(vp);
-        if (valLen == -1) {
+        int valLen = readValueInto(offset);
+        if (valLen < 0) {
             return null;
         }
         if (valLen == 0) {
             return "";
         }
-        byte[] vb = new byte[valLen];
-        readAt(vp + 4, vb, 0, valLen);
-        return new String(vb, UTF8);
+        byte[] b = valueBuffer.get();
+        int kl = Math.max(intFrom(b, 0), 0);
+        return new String(b, 8 + kl, valLen, UTF8);
     }
 
     private Record readRecordAt(long offset) throws IOException {
-        int keyLen = readInt(offset);
-        String key = null;
-        long p = offset + 4;
-        if (keyLen >= 0) {
-            byte[] kb = new byte[keyLen];
-            readAt(p, kb, 0, keyLen);
-            key = new String(kb, UTF8);
-            p += keyLen;
-        }
-        int valLen = readInt(p);
-        String value = null;
-        if (valLen >= 0) {
-            byte[] vb = new byte[valLen];
-            readAt(p + 4, vb, 0, valLen);
-            value = new String(vb, UTF8);
-        }
+        int valLen = readValueInto(offset);
+        byte[] b = valueBuffer.get();
+        int keyLen = intFrom(b, 0);
+        int kl = Math.max(keyLen, 0);
+        String key = keyLen < 0 ? null : new String(b, 4, keyLen, UTF8);
+        String value = valLen < 0 ? null
+                : (valLen == 0 ? "" : new String(b, 8 + kl, valLen, UTF8));
         return new Record(key, value);
-    }
-
-    private long recordLength(long offset) throws IOException {
-        int keyLen = readInt(offset);
-        long vp = offset + 4 + Math.max(keyLen, 0);
-        int valLen = readInt(vp);
-        return RECORD_OVERHEAD + Math.max(keyLen, 0) + Math.max(valLen, 0);
     }
 
     /**
@@ -331,7 +346,12 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
         int keyLen = keyBytes == null ? -1 : keyBytes.length;
         int valLen = valueBytes == null ? -1 : valueBytes.length;
         int total = RECORD_OVERHEAD + Math.max(keyLen, 0) + Math.max(valLen, 0);
-        ByteBuffer bb = ByteBuffer.allocate(total);
+        ByteBuffer bb = recordBuffer.get();
+        if (bb.capacity() < total) {
+            bb = ByteBuffer.allocate(total);
+            recordBuffer.set(bb);
+        }
+        bb.clear();
         bb.putInt(keyLen);
         if (keyBytes != null) {
             bb.put(keyBytes);
@@ -445,31 +465,30 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
 
         if (foundIndex >= 0) {
             long offset = offsets[foundIndex];
-            int keyLen = readInt(offset);
-            long vp = offset + 4 + Math.max(keyLen, 0);
-            int oldValLen = readInt(vp);
-            byte[] oldBytes = new byte[Math.max(oldValLen, 0)];
-            if (oldValLen > 0) {
-                readAt(vp + 4, oldBytes, 0, oldValLen);
-            }
+            int oldValLen = readValueInto(offset);   // 块读：整条记录在 valueBuffer，值在 [8+kl]
+            byte[] vb = valueBuffer.get();
+            int kl = Math.max(intFrom(vb, 0), 0);
 
             boolean sameValue;
             if (oldValLen == -1) {
                 sameValue = (valueBytes == null);
             } else if (valueBytes == null) {
                 sameValue = false;
+            } else if (oldValLen != valueBytes.length) {
+                sameValue = false;
             } else {
-                sameValue = oldValLen == valueBytes.length && Arrays.equals(oldBytes, valueBytes);
+                sameValue = Arrays.mismatch(vb, 8 + kl, 8 + kl + oldValLen,
+                        valueBytes, 0, oldValLen) < 0;
             }
             String oldValue = (oldValLen == -1)
                     ? null
-                    : (oldValLen == 0 ? "" : new String(oldBytes, UTF8));
+                    : (oldValLen == 0 ? "" : new String(vb, 8 + kl, oldValLen, UTF8));
             if (sameValue) {
                 return oldValue;   // 值未变，不写任何字节
             }
 
-            // 记录不可变，旧记录成为垃圾（无整理功能，仅计数）
-            garbageBytes += RECORD_OVERHEAD + Math.max(keyLen, 0) + Math.max(oldValLen, 0);
+            // 记录不可变，旧记录成为垃圾（无整理功能，仅计数）——块读已给出 kl/oldValLen
+            garbageBytes += RECORD_OVERHEAD + kl + Math.max(oldValLen, 0);
 
             long newOffset = appendRecord(keyBytes, valueBytes);
             offsets[foundIndex] = newOffset;
@@ -501,8 +520,12 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                 return null;
             }
             if (st == ST_OCCUPIED && hashes[i] == hash && keyEquals(offsets[i], keyBytes)) {
-                String oldValue = readValueAt(offsets[i]);
-                garbageBytes += recordLength(offsets[i]);
+                int valLen = readValueInto(offsets[i]);   // 块读一次：oldValue 与 recordLength 共用
+                byte[] b = valueBuffer.get();
+                int kl = Math.max(intFrom(b, 0), 0);
+                String oldValue = valLen < 0 ? null
+                        : (valLen == 0 ? "" : new String(b, 8 + kl, valLen, UTF8));
+                garbageBytes += RECORD_OVERHEAD + kl + Math.max(valLen, 0);
                 states[i] = ST_TOMBSTONE;   // 只动内存索引，数据区不动
                 hashes[i] = 0;
                 offsets[i] = -1;
@@ -626,8 +649,7 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                         continue;
                     }
                     long offset = offsets[i];
-                    long vp = valueLenPos(offset);
-                    int valLen = readInt(vp);
+                    int valLen = readValueInto(offset);   // 块读：整条记录在 valueBuffer，值在 [8+kl]
                     if (target == null) {
                         if (valLen == -1) {
                             return true;
@@ -640,9 +662,9 @@ public final class FileBackedMap implements Map<String, String>, Closeable {
                     if (valLen == 0) {
                         return true;
                     }
-                    byte[] vb = new byte[valLen];
-                    readAt(vp + 4, vb, 0, valLen);
-                    if (Arrays.equals(vb, target)) {
+                    int kl = Math.max(intFrom(valueBuffer.get(), 0), 0);
+                    if (Arrays.mismatch(valueBuffer.get(), 8 + kl, 8 + kl + valLen,
+                            target, 0, valLen) < 0) {
                         return true;
                     }
                 }
